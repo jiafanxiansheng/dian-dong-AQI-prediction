@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import pymysql
 from sqlalchemy import create_engine
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor
 from xgboost import XGBRegressor
@@ -8,6 +7,7 @@ from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.base import clone
 import joblib
 import os
 import warnings
@@ -49,9 +49,9 @@ def load_and_prepare_data(site_code):
     print("=" * 70)
     print(f"加载并处理站点 {site_code} 的数据")
     print("=" * 70)
-    
+
     table_name = f'air_quality_site_{site_code.lower()}'
-    
+
     try:
         query = f"SELECT * FROM `{table_name}` ORDER BY `datetime`"
         df = pd.read_sql(query, engine)
@@ -59,21 +59,24 @@ def load_and_prepare_data(site_code):
     except Exception as e:
         print(f"✗ 读取数据失败: {e}")
         return None, None
-    
+
     if len(df) < 100:
         print(f"✗ 数据量不足（{len(df)}条）")
         return None, None
-    
+
     # 数据预处理
     if 'id' in df.columns:
         df = df.drop('id', axis=1)
-    
+
     df['datetime'] = pd.to_datetime(df['datetime'])
     df = df.set_index('datetime')
     df = df.sort_index()
-    
+
     df = df.dropna(subset=['AQI'])
-    df = df.fillna(df.median())
+
+    # ✅ 修复pandas警告：使用ffill()替代fillna(method='ffill')
+    df = df.ffill(limit=3)  # 最多向前填充3小时
+    df = df.fillna(df.median())  # 剩余的用中位数填充
     
     # 特征工程
     # 1. 时间特征
@@ -88,15 +91,15 @@ def load_and_prepare_data(site_code):
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
     
-    # 3. 滞后特征（前1-23小时）
+    # 3. 滞后特征（前1-23小时，共24个时间点）
     pollutants = ['PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO']
     for pollutant in pollutants:
         if pollutant in df.columns:
             for lag in range(1, LAG_HOURS + 1):
                 df[f'{pollutant}_lag{lag}'] = df[pollutant].shift(lag)
     
-    # 4. 滚动窗口特征
-    rolling_windows = [3, 6, 12, 24]
+    # 4. 滚动窗口特征（✅ 添加12h捕捉中期趋势）
+    rolling_windows = [3, 6, 12]  # 短期+中期，移除24h
     for pollutant in pollutants:
         if pollutant in df.columns:
             for window in rolling_windows:
@@ -115,10 +118,7 @@ def load_and_prepare_data(site_code):
     # 创建目标变量
     df[f'AQI_future_{FORECAST_HOURS}h'] = df['AQI'].shift(-FORECAST_HOURS)
     
-    # 删除NaN值
-    df = df.dropna()
-    
-    # 排除未来信息
+    # ✅ 关键修复：先排除未来信息，再删除NaN
     columns_to_remove = []
     for col in df.columns:
         if 'future' in col.lower() and col != f'AQI_future_{FORECAST_HOURS}h':
@@ -129,13 +129,49 @@ def load_and_prepare_data(site_code):
     if columns_to_remove:
         df = df.drop(columns=columns_to_remove)
     
-    features_to_exclude = ['AQI', f'AQI_future_{FORECAST_HOURS}h']
+    # ✅ 关键修复：保留当前AQI作为特征！只排除目标变量
+    features_to_exclude = [f'AQI_future_{FORECAST_HOURS}h']  # 只排除目标，保留当前AQI
     target_col = f'AQI_future_{FORECAST_HOURS}h'
     
     X = df.drop(columns=[c for c in features_to_exclude if c in df.columns])
     y = df[target_col]
     
-    print(f"✓ 特征数量: {X.shape[1]}, 样本数量: {len(X)}")
+    # ✅ 调试：检查当前AQI是否在特征中
+    has_aqi_feature = 'AQI' in X.columns
+    print(f"\n🔍 调试信息:")
+    print(f"  - 当前AQI是否在特征中: {has_aqi_feature}")
+    if has_aqi_feature:
+        print(f"  - AQI列名: 'AQI'")
+        print(f"  - AQI数据范围: [{X['AQI'].min():.1f}, {X['AQI'].max():.1f}]")
+        print(f"  - AQI与目标变量的相关性: {X['AQI'].corr(y):.4f}")
+    else:
+        print(f"  ⚠️  警告：当前AQI不在特征中！")
+        aqi_cols = [col for col in X.columns if 'aqi' in col.lower()]
+        print(f"  - 包含AQI的列: {aqi_cols}")
+    
+    # ✅ 改进的缺失值处理：最后统一删除NaN
+    initial_len = len(X)
+    mask = X.notna().all(axis=1) & y.notna()
+    X = X[mask]
+    y = y[mask]
+    dropped_samples = initial_len - len(X)
+    
+    time_features = 4
+    periodic_features = 4
+    lag_features_count = 6 * LAG_HOURS
+    rolling_features_count = 6 * 3 * 4  # ✅ 3个窗口
+    diff_features_count = 6 * 3
+    
+    print(f"\n✓ 特征数量: {X.shape[1]}, 样本数量: {len(X)}")
+    print(f"  - 时间特征: {time_features}个 (hour, day_of_week, month, is_weekend)")
+    print(f"  - 周期性特征: {periodic_features}个 (hour_sin/cos, month_sin/cos)")
+    print(f"  - 滞后特征: {lag_features_count}个 (6污染物 × {LAG_HOURS}滞后)")
+    print(f"  - 滚动窗口: {rolling_features_count}个 (6污染物 × 3窗口 × 4统计)")
+    print(f"  - 变化率特征: {diff_features_count}个 (6污染物 × 3时间差)")
+    if has_aqi_feature:
+        print(f"  - 当前AQI: 1个 (✅ 关键特征)")
+    print(f"  - 总计: {X.shape[1]}个")
+    print(f"  - 因NaN丢弃样本: {dropped_samples}个 ({dropped_samples/initial_len*100:.1f}%)")
     
     return X, y
 
@@ -143,7 +179,7 @@ def load_and_prepare_data(site_code):
 # ==================== 树模型配置 ====================
 def get_tree_models():
     """定义所有树模型及其参数配置"""
-    
+
     models = {
         # ==================== Random Forest ====================
         'RF_Default': RandomForestRegressor(
@@ -155,7 +191,7 @@ def get_tree_models():
             random_state=42,
             n_jobs=-1
         ),
-        
+
         'RF_Optimized': RandomForestRegressor(
             n_estimators=300,
             max_depth=None,
@@ -165,7 +201,7 @@ def get_tree_models():
             random_state=42,
             n_jobs=-1
         ),
-        
+
         'RF_HighDepth': RandomForestRegressor(
             n_estimators=300,
             max_depth=20,
@@ -175,7 +211,7 @@ def get_tree_models():
             random_state=42,
             n_jobs=-1
         ),
-        
+
         'RF_LowDepth': RandomForestRegressor(
             n_estimators=300,
             max_depth=10,
@@ -185,7 +221,7 @@ def get_tree_models():
             random_state=42,
             n_jobs=-1
         ),
-        
+
         # ==================== Extra Trees ====================
         'ET_Default': ExtraTreesRegressor(
             n_estimators=100,
@@ -196,7 +232,7 @@ def get_tree_models():
             random_state=42,
             n_jobs=-1
         ),
-        
+
         'ET_Optimized': ExtraTreesRegressor(
             n_estimators=300,
             max_depth=None,
@@ -206,7 +242,7 @@ def get_tree_models():
             random_state=42,
             n_jobs=-1
         ),
-        
+
         'ET_Fast': ExtraTreesRegressor(
             n_estimators=200,
             max_depth=15,
@@ -216,7 +252,7 @@ def get_tree_models():
             random_state=42,
             n_jobs=-1
         ),
-        
+
         # ==================== Gradient Boosting ====================
         'GB_Default': GradientBoostingRegressor(
             n_estimators=100,
@@ -226,7 +262,7 @@ def get_tree_models():
             min_samples_leaf=1,
             random_state=42
         ),
-        
+
         'GB_Optimized': GradientBoostingRegressor(
             n_estimators=200,
             max_depth=5,
@@ -236,7 +272,7 @@ def get_tree_models():
             subsample=0.8,
             random_state=42
         ),
-        
+
         'GB_Slow': GradientBoostingRegressor(
             n_estimators=500,
             max_depth=4,
@@ -246,7 +282,7 @@ def get_tree_models():
             subsample=0.9,
             random_state=42
         ),
-        
+
         'GB_Fast': GradientBoostingRegressor(
             n_estimators=100,
             max_depth=6,
@@ -256,7 +292,7 @@ def get_tree_models():
             subsample=0.7,
             random_state=42
         ),
-        
+
         # ==================== XGBoost ====================
         'XGB_Default': XGBRegressor(
             n_estimators=100,
@@ -268,7 +304,7 @@ def get_tree_models():
             n_jobs=-1,
             verbosity=0
         ),
-        
+
         'XGB_Optimized': XGBRegressor(
             n_estimators=300,
             max_depth=6,
@@ -280,7 +316,7 @@ def get_tree_models():
             n_jobs=-1,
             verbosity=0
         ),
-        
+
         'XGB_Deep': XGBRegressor(
             n_estimators=200,
             max_depth=10,
@@ -292,7 +328,7 @@ def get_tree_models():
             n_jobs=-1,
             verbosity=0
         ),
-        
+
         'XGB_Fast': XGBRegressor(
             n_estimators=150,
             max_depth=4,
@@ -303,7 +339,7 @@ def get_tree_models():
             n_jobs=-1,
             verbosity=0
         ),
-        
+
         # ==================== LightGBM ====================
         'LGB_Default': LGBMRegressor(
             n_estimators=100,
@@ -315,7 +351,7 @@ def get_tree_models():
             n_jobs=-1,
             verbose=-1
         ),
-        
+
         'LGB_Optimized': LGBMRegressor(
             n_estimators=300,
             max_depth=6,
@@ -329,7 +365,7 @@ def get_tree_models():
             n_jobs=-1,
             verbose=-1
         ),
-        
+
         'LGB_Leaf': LGBMRegressor(
             n_estimators=300,
             max_depth=-1,
@@ -342,7 +378,7 @@ def get_tree_models():
             n_jobs=-1,
             verbose=-1
         ),
-        
+
         'LGB_Fast': LGBMRegressor(
             n_estimators=150,
             max_depth=8,
@@ -353,7 +389,7 @@ def get_tree_models():
             n_jobs=-1,
             verbose=-1
         ),
-        
+
         # ==================== CatBoost ====================
         'CatBoost_Default': CatBoostRegressor(
             iterations=100,
@@ -363,7 +399,7 @@ def get_tree_models():
             verbose=0,
             thread_count=-1
         ),
-        
+
         'CatBoost_Optimized': CatBoostRegressor(
             iterations=300,
             depth=6,
@@ -374,7 +410,7 @@ def get_tree_models():
             verbose=0,
             thread_count=-1
         ),
-        
+
         'CatBoost_Slow': CatBoostRegressor(
             iterations=500,
             depth=8,
@@ -385,7 +421,7 @@ def get_tree_models():
             thread_count=-1
         ),
     }
-    
+
     return models
 
 
@@ -397,26 +433,26 @@ def get_model_descriptions():
         'RF_Optimized': '随机森林-优化参数 (300棵树, min_samples_split=10)',
         'RF_HighDepth': '随机森林-高深度 (max_depth=20)',
         'RF_LowDepth': '随机森林-低深度防过拟合 (max_depth=10, 强正则化)',
-        
+
         'ET_Default': '极端随机树-默认参数',
         'ET_Optimized': '极端随机树-优化参数',
         'ET_Fast': '极端随机树-快速版本 (限制深度和特征)',
-        
+
         'GB_Default': '梯度提升树-默认参数',
         'GB_Optimized': '梯度提升树-优化参数 (subsample=0.8)',
         'GB_Slow': '梯度提升树-慢速高精度 (500棵树, lr=0.05)',
         'GB_Fast': '梯度提升树-快速版本 (100棵树, lr=0.2)',
-        
+
         'XGB_Default': 'XGBoost-默认参数',
         'XGB_Optimized': 'XGBoost-优化参数 (gamma正则化)',
         'XGB_Deep': 'XGBoost-深树版本 (max_depth=10)',
         'XGB_Fast': 'XGBoost-快速版本',
-        
+
         'LGB_Default': 'LightGBM-默认参数',
         'LGB_Optimized': 'LightGBM-优化参数 (L1/L2正则化)',
         'LGB_Leaf': 'LightGBM-Leaf-wise生长策略',
         'LGB_Fast': 'LightGBM-快速版本',
-        
+
         'CatBoost_Default': 'CatBoost-默认参数',
         'CatBoost_Optimized': 'CatBoost-优化参数 (bagging)',
         'CatBoost_Slow': 'CatBoost-慢速高精度 (500轮)',
@@ -429,57 +465,80 @@ def evaluate_model_cv(model, X, y, model_name):
     """使用时间序列交叉验证评估模型"""
     print(f"\n评估模型: {model_name}")
     print("-" * 70)
-    
+
     tscv = TimeSeriesSplit(n_splits=5)
-    
+
     cv_scores = {
         'mse': [],
         'rmse': [],
         'mae': [],
         'r2': []
     }
-    
+
     start_time = time.time()
     
+    best_fold_model = None
+    best_fold_r2 = -np.inf
+
     for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
         X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
         y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
-        
+
         # 训练模型
-        from sklearn.base import clone
         fold_model = clone(model)
         fold_model.fit(X_train_fold, y_train_fold)
-        
+
         # 预测
         y_val_pred = fold_model.predict(X_val_fold)
-        
+
         # 计算指标
         mse = mean_squared_error(y_val_fold, y_val_pred)
         rmse = np.sqrt(mse)
         mae = mean_absolute_error(y_val_fold, y_val_pred)
         r2 = r2_score(y_val_fold, y_val_pred)
-        
+
         cv_scores['mse'].append(mse)
         cv_scores['rmse'].append(rmse)
         cv_scores['mae'].append(mae)
         cv_scores['r2'].append(r2)
         
+        # 保存最佳fold的模型用于特征重要性分析
+        if r2 > best_fold_r2:
+            best_fold_r2 = r2
+            best_fold_model = fold_model
+
         print(f"  Fold {fold+1}/5: R²={r2:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}")
-    
+
     elapsed_time = time.time() - start_time
-    
+
     # 计算平均指标
     avg_r2 = np.mean(cv_scores['r2'])
     avg_rmse = np.mean(cv_scores['rmse'])
     avg_mae = np.mean(cv_scores['mae'])
     std_r2 = np.std(cv_scores['r2'])
-    
+
     print(f"\n✓ {model_name} 交叉验证结果:")
     print(f"  R² = {avg_r2:.4f} ± {std_r2:.4f}")
     print(f"  RMSE = {avg_rmse:.2f}")
     print(f"  MAE = {avg_mae:.2f}")
     print(f"  耗时 = {elapsed_time:.2f}秒")
     
+    # 输出特征重要性（Top 10）
+    try:
+        if hasattr(best_fold_model, 'feature_importances_'):
+            importances = best_fold_model.feature_importances_
+            feature_names = X.columns
+            importance_df = pd.DataFrame({
+                'feature': feature_names,
+                'importance': importances
+            }).sort_values('importance', ascending=False)
+            
+            print(f"\n  Top 10 重要特征:")
+            for idx, row in importance_df.head(10).iterrows():
+                print(f"    {row['feature']:30s}: {row['importance']:.4f}")
+    except Exception as e:
+        print(f"  ⚠ 无法提取特征重要性: {e}")
+
     return {
         'model_name': model_name,
         'r2_mean': avg_r2,
@@ -493,70 +552,70 @@ def evaluate_model_cv(model, X, y, model_name):
 # ==================== 主程序 ====================
 if __name__ == '__main__':
     print("=" * 70)
-    print("🌲 树模型对比实验 - AQI预测")
+    print(" 树模型对比实验 - AQI预测")
     print("=" * 70)
     print(f"\n配置参数:")
     print(f"  - 测试站点: {SITE_CODE}")
     print(f"  - 预测未来: {FORECAST_HOURS}小时")
     print(f"  - 滞后特征: 前{LAG_HOURS}小时")
     print(f"  - 交叉验证: 5折时间序列")
-    
+
     # 加载数据
     X, y = load_and_prepare_data(SITE_CODE)
-    
+
     if X is None:
         print("\n❌ 数据加载失败，程序退出")
         exit(1)
-    
+
     # 获取树模型
     models = get_tree_models()
     descriptions = get_model_descriptions()
-    
-    print(f"\n 将要评估 {len(models)} 个树模型:")
+
+    print(f"\n📋 将要评估 {len(models)} 个树模型:")
     for i, (name, desc) in enumerate(descriptions.items(), 1):
         print(f"  {i:2d}. {name:<20s} - {desc}")
-    
+
     # 评估所有模型
     all_results = []
-    
+
     for model_name, model in models.items():
         result = evaluate_model_cv(model, X, y, model_name)
         result['description'] = descriptions.get(model_name, '')
         all_results.append(result)
-        
+
         # 保存模型
         model_path = os.path.join(output_dir, f'{model_name.lower()}_model.pkl')
         joblib.dump(model, model_path)
         print(f"  ✓ 模型已保存: {model_path}\n")
-    
+
     # ==================== 汇总结果 ====================
     print("\n\n" + "=" * 70)
     print("📊 树模型对比结果汇总")
     print("=" * 70)
-    
+
     results_df = pd.DataFrame(all_results)
-    
+
     # 按R²排序
     results_df = results_df.sort_values('r2_mean', ascending=False).reset_index(drop=True)
-    
+
     print("\n模型性能排名:")
     print("-" * 100)
     print(f"{'排名':<6} | {'模型':<22} | {'R² (均值)':<12} | {'R² (标准差)':<12} | {'RMSE':<10} | {'MAE':<10} | {'耗时(s)':<10}")
     print("-" * 100)
-    
+
     for idx, row in results_df.iterrows():
         print(
             f"{idx+1:<6} | {row['model_name']:<22} | {row['r2_mean']:<12.4f} | {row['r2_std']:<12.4f} | "
             f"{row['rmse']:<10.2f} | {row['mae']:<10.2f} | {row['time']:<10.2f}"
         )
-    
+
     print("-" * 100)
-    
+
     # 保存结果
     summary_path = os.path.join(output_dir, 'tree_model_comparison_results.csv')
     results_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
     print(f"\n✓ 对比结果已保存: {summary_path}")
-    
+
     # 找出最佳模型
     best_model = results_df.iloc[0]
     print(f"\n🏆 最佳模型: {best_model['model_name']}")
@@ -564,12 +623,12 @@ if __name__ == '__main__':
     print(f"   R² = {best_model['r2_mean']:.4f} ± {best_model['r2_std']:.4f}")
     print(f"   RMSE = {best_model['rmse']:.2f}")
     print(f"   MAE = {best_model['mae']:.2f}")
-    
+
     # 按模型家族分类分析
     print("\n" + "=" * 70)
-    print(" 按模型家族分类对比")
+    print("📈 按模型家族分类对比")
     print("=" * 70)
-    
+
     model_families = {
         'Random Forest': [name for name in results_df['model_name'] if name.startswith('RF_')],
         'Extra Trees': [name for name in results_df['model_name'] if name.startswith('ET_')],
@@ -578,17 +637,17 @@ if __name__ == '__main__':
         'LightGBM': [name for name in results_df['model_name'] if name.startswith('LGB_')],
         'CatBoost': [name for name in results_df['model_name'] if name.startswith('CatBoost_')]
     }
-    
+
     for family, model_names in model_families.items():
         family_results = results_df[results_df['model_name'].isin(model_names)]
         if len(family_results) > 0:
             best_in_family = family_results.iloc[0]
             avg_r2 = family_results['r2_mean'].mean()
-            print(f"\n {family}:")
+            print(f"\n🌳 {family}:")
             print(f"   最佳: {best_in_family['model_name']} (R²={best_in_family['r2_mean']:.4f})")
             print(f"   平均: R²={avg_r2:.4f}")
             print(f"   变体数: {len(family_results)}")
-    
+
     # Top 5 推荐
     print("\n" + "=" * 70)
     print("🎯 Top 5 推荐模型")
@@ -598,5 +657,5 @@ if __name__ == '__main__':
         print(f"\n  #{idx+1}: {row['model_name']}")
         print(f"      {row['description']}")
         print(f"      R² = {row['r2_mean']:.4f} ± {row['r2_std']:.4f}")
-    
+
     print("\n✅ 树模型对比完成！")

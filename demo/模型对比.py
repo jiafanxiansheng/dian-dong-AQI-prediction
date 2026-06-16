@@ -1,17 +1,33 @@
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine
-from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor
-from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
+from sklearn.ensemble import RandomForestRegressor
 from catboost import CatBoostRegressor
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.base import clone
+from sklearn.preprocessing import MinMaxScaler
 import joblib
 import os
 import warnings
 import time
+
+# 新增：时序模型相关库
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    print("⚠️ 警告: PyTorch未安装，LSTM模型将不可用")
+
+try:
+    from prophet import Prophet
+    HAS_PROPHET = True
+except ImportError:
+    HAS_PROPHET = False
+    print("⚠️ 警告: Prophet未安装，Prophet模型将不可用")
 
 warnings.filterwarnings('ignore')
 
@@ -182,241 +198,23 @@ def load_and_prepare_data(site_code):
     print(f"  - 时间特征: {time_features_count}个")
     print(f"  - 周期性特征: {periodic_features_count}个")
     print(f"  - AQI滚动统计: {aqi_rolling_count}个 (✅ 新增)")
-    print(f"  - 滞后特征: {lag_count}个 (✅ 优化为关键时间点)")
-    print(f"  - 滚动窗口: {rolling_count}个 (✅ 只保留均值/标准差)")
-    print(f"  - 变化率特征: {diff_count}个 (✅ 只保留1h/3h)")
+    print(f"  - 滞后特征: {lag_count}个 (✅ 完整24小时)")
+    print(f"  - 滚动窗口: {rolling_count}个 (✅ 含24h窗口)")
+    print(f"  - 变化率特征: {diff_count}个 (✅ 含中长期)")
     if has_aqi_feature:
         print(f"  - 当前AQI: 1个 (✅ 关键特征)")
     print(f"  - 总计: {X.shape[1]}个")
     print(f"  - 因NaN丢弃样本: {dropped_samples}个 ({dropped_samples/initial_len*100:.1f}%)")
     
-    return X, y
+    return X, y, df
 
 
-# ==================== 树模型配置 ====================
+# ==================== 树模型配置（精简版）====================
 def get_tree_models():
-    """定义所有树模型及其参数配置"""
+    """定义精选的树模型"""
 
     models = {
-        # ==================== Random Forest ====================
-        'RF_Default': RandomForestRegressor(
-            n_estimators=100,
-            max_depth=None,
-            min_samples_split=2,
-            min_samples_leaf=1,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        ),
-
-        'RF_Optimized': RandomForestRegressor(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        ),
-
-        'RF_HighDepth': RandomForestRegressor(
-            n_estimators=300,
-            max_depth=20,
-            min_samples_split=5,
-            min_samples_leaf=3,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        ),
-
-        'RF_LowDepth': RandomForestRegressor(
-            n_estimators=300,
-            max_depth=10,
-            min_samples_split=15,
-            min_samples_leaf=8,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        ),
-
-        # ==================== Extra Trees ====================
-        'ET_Default': ExtraTreesRegressor(
-            n_estimators=100,
-            max_depth=None,
-            min_samples_split=2,
-            min_samples_leaf=1,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        ),
-
-        'ET_Optimized': ExtraTreesRegressor(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        ),
-
-        'ET_Fast': ExtraTreesRegressor(
-            n_estimators=200,
-            max_depth=15,
-            min_samples_split=8,
-            min_samples_leaf=4,
-            max_features=0.5,
-            random_state=42,
-            n_jobs=-1
-        ),
-
-        # ==================== Gradient Boosting ====================
-        'GB_Default': GradientBoostingRegressor(
-            n_estimators=100,
-            max_depth=3,
-            learning_rate=0.1,
-            min_samples_split=2,
-            min_samples_leaf=1,
-            random_state=42
-        ),
-
-        'GB_Optimized': GradientBoostingRegressor(
-            n_estimators=200,
-            max_depth=5,
-            learning_rate=0.1,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            subsample=0.8,
-            random_state=42
-        ),
-
-        'GB_Slow': GradientBoostingRegressor(
-            n_estimators=500,
-            max_depth=4,
-            learning_rate=0.05,
-            min_samples_split=8,
-            min_samples_leaf=4,
-            subsample=0.9,
-            random_state=42
-        ),
-
-        'GB_Fast': GradientBoostingRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.2,
-            min_samples_split=15,
-            min_samples_leaf=8,
-            subsample=0.7,
-            random_state=42
-        ),
-
-        # ==================== XGBoost ====================
-        'XGB_Default': XGBRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            subsample=1.0,
-            colsample_bytree=1.0,
-            random_state=42,
-            n_jobs=-1,
-            verbosity=0
-        ),
-
-        'XGB_Optimized': XGBRegressor(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            gamma=0.1,
-            random_state=42,
-            n_jobs=-1,
-            verbosity=0
-        ),
-
-        'XGB_Deep': XGBRegressor(
-            n_estimators=200,
-            max_depth=10,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.7,
-            gamma=0.2,
-            random_state=42,
-            n_jobs=-1,
-            verbosity=0
-        ),
-
-        'XGB_Fast': XGBRegressor(
-            n_estimators=150,
-            max_depth=4,
-            learning_rate=0.2,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=42,
-            n_jobs=-1,
-            verbosity=0
-        ),
-
-        # ==================== LightGBM ====================
-        'LGB_Default': LGBMRegressor(
-            n_estimators=100,
-            max_depth=-1,
-            learning_rate=0.1,
-            subsample=1.0,
-            colsample_bytree=1.0,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1
-        ),
-
-        'LGB_Optimized': LGBMRegressor(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_samples=10,
-            reg_alpha=0.1,
-            reg_lambda=0.1,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1
-        ),
-
-        'LGB_Leaf': LGBMRegressor(
-            n_estimators=300,
-            max_depth=-1,
-            learning_rate=0.05,
-            num_leaves=31,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_samples=20,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1
-        ),
-
-        'LGB_Fast': LGBMRegressor(
-            n_estimators=150,
-            max_depth=8,
-            learning_rate=0.2,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1
-        ),
-
-        # ==================== CatBoost ====================
-        'CatBoost_Default': CatBoostRegressor(
-            iterations=100,
-            depth=6,
-            learning_rate=0.1,
-            random_state=42,
-            verbose=0,
-            thread_count=-1
-        ),
-
+        # ==================== CatBoost (Boosting家族代表) ====================
         'CatBoost_Optimized': CatBoostRegressor(
             iterations=300,
             depth=6,
@@ -428,58 +226,255 @@ def get_tree_models():
             thread_count=-1
         ),
 
-        'CatBoost_Slow': CatBoostRegressor(
-            iterations=500,
-            depth=8,
-            learning_rate=0.05,
-            l2_leaf_reg=5,
+        # ==================== Random Forest (Bagging家族代表) ====================
+        'RF_Optimized': RandomForestRegressor(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            max_features='sqrt',
             random_state=42,
-            verbose=0,
-            thread_count=-1
+            n_jobs=-1
         ),
     }
 
     return models
 
 
-# ==================== 模型说明 ====================
 def get_model_descriptions():
     """获取每个模型的参数说明"""
     descriptions = {
-        'RF_Default': '随机森林-默认参数 (100棵树)',
-        'RF_Optimized': '随机森林-优化参数 (300棵树, min_samples_split=10)',
-        'RF_HighDepth': '随机森林-高深度 (max_depth=20)',
-        'RF_LowDepth': '随机森林-低深度防过拟合 (max_depth=10, 强正则化)',
-
-        'ET_Default': '极端随机树-默认参数',
-        'ET_Optimized': '极端随机树-优化参数',
-        'ET_Fast': '极端随机树-快速版本 (限制深度和特征)',
-
-        'GB_Default': '梯度提升树-默认参数',
-        'GB_Optimized': '梯度提升树-优化参数 (subsample=0.8)',
-        'GB_Slow': '梯度提升树-慢速高精度 (500棵树, lr=0.05)',
-        'GB_Fast': '梯度提升树-快速版本 (100棵树, lr=0.2)',
-
-        'XGB_Default': 'XGBoost-默认参数',
-        'XGB_Optimized': 'XGBoost-优化参数 (gamma正则化)',
-        'XGB_Deep': 'XGBoost-深树版本 (max_depth=10)',
-        'XGB_Fast': 'XGBoost-快速版本',
-
-        'LGB_Default': 'LightGBM-默认参数',
-        'LGB_Optimized': 'LightGBM-优化参数 (L1/L2正则化)',
-        'LGB_Leaf': 'LightGBM-Leaf-wise生长策略',
-        'LGB_Fast': 'LightGBM-快速版本',
-
-        'CatBoost_Default': 'CatBoost-默认参数',
-        'CatBoost_Optimized': 'CatBoost-优化参数 (bagging)',
-        'CatBoost_Slow': 'CatBoost-慢速高精度 (500轮)',
+        'CatBoost_Optimized': 'CatBoost-优化参数 (Boosting家族代表, 抗过拟合强)',
+        'RF_Optimized': '随机森林-优化参数 (Bagging家族代表, 稳定性好)',
     }
     return descriptions
 
 
-# ==================== 时间序列交叉验证 ====================
-def evaluate_model_cv(model, X, y, model_name):
-    """使用时间序列交叉验证评估模型"""
+# ==================== LSTM模型定义 ====================
+if HAS_TORCH:
+    class LSTMModel(nn.Module):
+        """LSTM时序预测模型"""
+        def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
+            super(LSTMModel, self).__init__()
+            self.hidden_size = hidden_size
+            self.num_layers = num_layers
+            
+            self.lstm = nn.LSTM(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0
+            )
+            
+            self.fc = nn.Sequential(
+                nn.Linear(hidden_size, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1)
+            )
+        
+        def forward(self, x):
+            h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size)
+            c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size)
+            
+            lstm_out, _ = self.lstm(x, (h0, c0))
+            out = self.fc(lstm_out[:, -1, :])
+            return out.squeeze()
+
+
+def prepare_lstm_data(X, y, sequence_length=24):
+    """为LSTM准备序列数据"""
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y.values.reshape(-1, 1)).flatten()
+    
+    X_seq, y_seq = [], []
+    for i in range(len(X_scaled) - sequence_length):
+        X_seq.append(X_scaled[i:i+sequence_length])
+        y_seq.append(y_scaled[i+sequence_length])
+    
+    return np.array(X_seq), np.array(y_seq), scaler_X, scaler_y
+
+
+def train_lstm_model(X_train, y_train, X_val, y_val, epochs=50, batch_size=64, learning_rate=0.001):
+    """训练LSTM模型"""
+    if not HAS_TORCH:
+        return None
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"  使用设备: {device}")
+    
+    # 准备数据
+    sequence_length = 24
+    X_train_seq, y_train_seq, scaler_X, scaler_y = prepare_lstm_data(X_train, y_train, sequence_length)
+    X_val_seq, y_val_seq, _, _ = prepare_lstm_data(X_val, y_val, sequence_length)
+    
+    # 转换为Tensor
+    X_train_tensor = torch.FloatTensor(X_train_seq).to(device)
+    y_train_tensor = torch.FloatTensor(y_train_seq).to(device)
+    X_val_tensor = torch.FloatTensor(X_val_seq).to(device)
+    y_val_tensor = torch.FloatTensor(y_val_seq).to(device)
+    
+    # 创建DataLoader
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+    
+    # 初始化模型
+    input_size = X_train.shape[1]
+    model = LSTMModel(input_size=input_size, hidden_size=64, num_layers=2, dropout=0.2).to(device)
+    
+    # 损失函数和优化器
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # 训练循环
+    best_val_loss = float('inf')
+    best_model_state = None
+    
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        
+        for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # 验证
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_tensor)
+            val_loss = criterion(val_outputs, y_val_tensor)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = model.state_dict().copy()
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"    Epoch [{epoch+1}/{epochs}], Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss:.4f}")
+    
+    # 加载最佳模型
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    return model, scaler_X, scaler_y, sequence_length
+
+
+def predict_lstm(model, X, scaler_X, scaler_y, sequence_length):
+    """使用LSTM模型预测"""
+    if not HAS_TORCH:
+        return None
+    
+    device = next(model.parameters()).device
+    X_scaled = scaler_X.transform(X)
+    
+    # 构建序列
+    X_seq = []
+    for i in range(len(X_scaled) - sequence_length + 1):
+        X_seq.append(X_scaled[i:i+sequence_length])
+    X_seq = np.array(X_seq)
+    
+    X_tensor = torch.FloatTensor(X_seq).to(device)
+    model.eval()
+    with torch.no_grad():
+        predictions_scaled = model(X_tensor).cpu().numpy()
+    
+    # 反标准化
+    predictions = scaler_y.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+    
+    return predictions
+
+
+# ==================== Prophet模型封装 ====================
+class ProphetWrapper:
+    """Prophet模型包装器，用于兼容sklearn接口"""
+    
+    def __init__(self, growth='linear', yearly_seasonality=True, 
+                 weekly_seasonality=True, daily_seasonality=True,
+                 changepoint_prior_scale=0.05):
+        self.growth = growth
+        self.yearly_seasonality = yearly_seasonality
+        self.weekly_seasonality = weekly_seasonality
+        self.daily_seasonality = daily_seasonality
+        self.changepoint_prior_scale = changepoint_prior_scale
+        self.model = None
+        self.scaler_y = None
+    
+    def fit(self, X, y):
+        """训练Prophet模型"""
+        if not HAS_PROPHET:
+            raise ImportError("Prophet未安装")
+        
+        # Prophet需要datetime索引
+        if hasattr(X, 'index'):
+            dates = X.index
+        else:
+            raise ValueError("Prophet需要带datetime索引的数据")
+        
+        # 标准化y
+        self.scaler_y = MinMaxScaler()
+        y_scaled = self.scaler_y.fit_transform(y.values.reshape(-1, 1)).flatten()
+        
+        # 准备Prophet数据格式
+        df_prophet = pd.DataFrame({
+            'ds': dates,
+            'y': y_scaled
+        })
+        
+        # 创建并训练模型
+        self.model = Prophet(
+            growth=self.growth,
+            yearly_seasonality=self.yearly_seasonality,
+            weekly_seasonality=self.weekly_seasonality,
+            daily_seasonality=self.daily_seasonality,
+            changepoint_prior_scale=self.changepoint_prior_scale
+        )
+        
+        # 添加额外的回归变量（选择重要特征）
+        feature_cols = ['AQI', 'hour', 'day_of_week', 'month']
+        available_cols = [col for col in feature_cols if col in X.columns]
+        
+        for col in available_cols:
+            df_prophet[col] = X[col].values
+            self.model.add_regressor(col)
+        
+        self.model.fit(df_prophet)
+        self.feature_cols = available_cols
+        
+        return self
+    
+    def predict(self, X):
+        """使用Prophet模型预测"""
+        if not HAS_PROPHET or self.model is None:
+            raise ValueError("模型未训练或Prophet未安装")
+        
+        # 准备预测数据
+        dates = X.index
+        df_future = pd.DataFrame({'ds': dates})
+        
+        # 添加回归变量
+        for col in self.feature_cols:
+            if col in X.columns:
+                df_future[col] = X[col].values
+        
+        # 预测
+        forecast = self.model.predict(df_future)
+        predictions_scaled = forecast['yhat'].values
+        
+        # 反标准化
+        predictions = self.scaler_y.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+        
+        return predictions
+
+
+# ==================== 模型评估函数 ====================
+def evaluate_model_cv(model, X, y, model_name, model_type='tree'):
+    """通用模型评估函数（支持树模型、LSTM、Prophet）"""
     print(f"\n评估模型: {model_name}")
     print("-" * 70)
 
@@ -501,32 +496,78 @@ def evaluate_model_cv(model, X, y, model_name):
         X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
         y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
 
-        # 训练模型
-        fold_model = clone(model)
-        fold_model.fit(X_train_fold, y_train_fold)
+        try:
+            if model_type == 'lstm':
+                # LSTM训练
+                if not HAS_TORCH:
+                    print(f"  ✗ Fold {fold+1}: PyTorch未安装")
+                    continue
+                lstm_result = train_lstm_model(X_train_fold, y_train_fold, X_val_fold, y_val_fold, 
+                                               epochs=30, batch_size=64, learning_rate=0.001)
+                if lstm_result is None:
+                    continue
+                fold_model, scaler_X, scaler_y, seq_len = lstm_result
+                
+                # 预测
+                y_val_pred = predict_lstm(fold_model, X_val_fold, scaler_X, scaler_y, seq_len)
+                
+                # 对齐长度
+                min_len = min(len(y_val_pred), len(y_val_fold))
+                y_val_pred = y_val_pred[:min_len]
+                y_val_fold_array = y_val_fold.iloc[:min_len].values
+                
+            elif model_type == 'prophet':
+                # Prophet训练
+                if not HAS_PROPHET:
+                    print(f"  ✗ Fold {fold+1}: Prophet未安装")
+                    continue
+                fold_model = clone(model)
+                fold_model.fit(X_train_fold, y_train_fold)
+                
+                # 预测
+                y_val_pred = fold_model.predict(X_val_fold)
+                
+                # 对齐长度
+                min_len = min(len(y_val_pred), len(y_val_fold))
+                y_val_pred = y_val_pred[:min_len]
+                y_val_fold_array = y_val_fold.iloc[:min_len].values
+                
+            else:
+                # 树模型训练
+                fold_model = clone(model)
+                fold_model.fit(X_train_fold, y_train_fold)
+                
+                # 预测
+                y_val_pred = fold_model.predict(X_val_fold)
+                y_val_fold_array = y_val_fold.values
+            
+            # 计算指标
+            mse = mean_squared_error(y_val_fold_array, y_val_pred)
+            rmse = np.sqrt(mse)
+            mae = mean_absolute_error(y_val_fold_array, y_val_pred)
+            r2 = r2_score(y_val_fold_array, y_val_pred)
 
-        # 预测
-        y_val_pred = fold_model.predict(X_val_fold)
+            cv_scores['mse'].append(mse)
+            cv_scores['rmse'].append(rmse)
+            cv_scores['mae'].append(mae)
+            cv_scores['r2'].append(r2)
+            
+            # 保存最佳fold的模型
+            if r2 > best_fold_r2:
+                best_fold_r2 = r2
+                best_fold_model = fold_model
 
-        # 计算指标
-        mse = mean_squared_error(y_val_fold, y_val_pred)
-        rmse = np.sqrt(mse)
-        mae = mean_absolute_error(y_val_fold, y_val_pred)
-        r2 = r2_score(y_val_fold, y_val_pred)
-
-        cv_scores['mse'].append(mse)
-        cv_scores['rmse'].append(rmse)
-        cv_scores['mae'].append(mae)
-        cv_scores['r2'].append(r2)
+            print(f"  Fold {fold+1}/5: R²={r2:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}")
         
-        # 保存最佳fold的模型用于特征重要性分析
-        if r2 > best_fold_r2:
-            best_fold_r2 = r2
-            best_fold_model = fold_model
-
-        print(f"  Fold {fold+1}/5: R²={r2:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}")
+        except Exception as e:
+            print(f"  ✗ Fold {fold+1} 失败: {str(e)}")
+            continue
 
     elapsed_time = time.time() - start_time
+
+    if len(cv_scores['r2']) == 0:
+        print(f"  ✗ 所有fold均失败")
+        return None
 
     # 计算平均指标
     avg_r2 = np.mean(cv_scores['r2'])
@@ -540,21 +581,22 @@ def evaluate_model_cv(model, X, y, model_name):
     print(f"  MAE = {avg_mae:.2f}")
     print(f"  耗时 = {elapsed_time:.2f}秒")
     
-    # 输出特征重要性（Top 10）
-    try:
-        if hasattr(best_fold_model, 'feature_importances_'):
-            importances = best_fold_model.feature_importances_
-            feature_names = X.columns
-            importance_df = pd.DataFrame({
-                'feature': feature_names,
-                'importance': importances
-            }).sort_values('importance', ascending=False)
-            
-            print(f"\n  Top 10 重要特征:")
-            for idx, row in importance_df.head(10).iterrows():
-                print(f"    {row['feature']:30s}: {row['importance']:.4f}")
-    except Exception as e:
-        print(f"  ⚠ 无法提取特征重要性: {e}")
+    # 输出特征重要性（仅树模型）
+    if model_type == 'tree':
+        try:
+            if hasattr(best_fold_model, 'feature_importances_'):
+                importances = best_fold_model.feature_importances_
+                feature_names = X.columns
+                importance_df = pd.DataFrame({
+                    'feature': feature_names,
+                    'importance': importances
+                }).sort_values('importance', ascending=False)
+                
+                print(f"\n  Top 10 重要特征:")
+                for idx, row in importance_df.head(10).iterrows():
+                    print(f"    {row['feature']:30s}: {row['importance']:.4f}")
+        except Exception as e:
+            print(f"  ⚠ 无法提取特征重要性: {e}")
 
     return {
         'model_name': model_name,
@@ -569,45 +611,78 @@ def evaluate_model_cv(model, X, y, model_name):
 # ==================== 主程序 ====================
 if __name__ == '__main__':
     print("=" * 70)
-    print(" 树模型对比实验 - AQI预测")
+    print(" 模型对比实验 - AQI预测（树模型 + 时序模型）")
     print("=" * 70)
     print(f"\n配置参数:")
     print(f"  - 测试站点: {SITE_CODE}")
     print(f"  - 预测未来: {FORECAST_HOURS}小时")
     print(f"  - 滞后特征: 前{LAG_HOURS}小时")
     print(f"  - 交叉验证: 5折时间序列")
+    print(f"  - PyTorch可用: {HAS_TORCH}")
+    print(f"  - Prophet可用: {HAS_PROPHET}")
 
     # 加载数据
-    X, y = load_and_prepare_data(SITE_CODE)
+    X, y, df_original = load_and_prepare_data(SITE_CODE)
 
     if X is None:
         print("\n❌ 数据加载失败，程序退出")
         exit(1)
 
-    # 获取树模型
-    models = get_tree_models()
+    # ==================== 获取模型 ====================
+    tree_models = get_tree_models()
     descriptions = get_model_descriptions()
 
-    print(f"\n📋 将要评估 {len(models)} 个树模型:")
-    for i, (name, desc) in enumerate(descriptions.items(), 1):
+    all_models = {}
+    all_descriptions = {}
+    
+    # 添加树模型
+    for name, model in tree_models.items():
+        all_models[name] = (model, 'tree')
+        all_descriptions[name] = descriptions.get(name, '')
+    
+    # 添加LSTM模型
+    if HAS_TORCH:
+        all_models['LSTM'] = (None, 'lstm')
+        all_descriptions['LSTM'] = '长短期记忆网络 (深度学习时序模型)'
+    else:
+        print("\n⚠️ 跳过LSTM模型（PyTorch未安装）")
+    
+    # 添加Prophet模型
+    if HAS_PROPHET:
+        all_models['Prophet'] = (ProphetWrapper(), 'prophet')
+        all_descriptions['Prophet'] = 'Facebook Prophet (统计时序模型)'
+    else:
+        print("\n⚠️ 跳过Prophet模型（Prophet未安装）")
+
+    print(f"\n📋 将要评估 {len(all_models)} 个模型:")
+    for i, (name, desc) in enumerate(all_descriptions.items(), 1):
         print(f"  {i:2d}. {name:<20s} - {desc}")
 
-    # 评估所有模型
+    # ==================== 评估所有模型 ====================
     all_results = []
 
-    for model_name, model in models.items():
-        result = evaluate_model_cv(model, X, y, model_name)
-        result['description'] = descriptions.get(model_name, '')
-        all_results.append(result)
+    for model_name, (model, model_type) in all_models.items():
+        result = evaluate_model_cv(model, X, y, model_name, model_type=model_type)
+        
+        if result is not None:
+            result['description'] = all_descriptions.get(model_name, '')
+            all_results.append(result)
 
-        # 保存模型
-        model_path = os.path.join(output_dir, f'{model_name.lower()}_model.pkl')
-        joblib.dump(model, model_path)
-        print(f"  ✓ 模型已保存: {model_path}\n")
+            # 保存模型（树模型才保存）
+            if model_type == 'tree' and model is not None:
+                model_path = os.path.join(output_dir, f'{model_name.lower()}_model.pkl')
+                joblib.dump(model, model_path)
+                print(f"  ✓ 模型已保存: {model_path}\n")
+        else:
+            print(f"  ✗ {model_name} 评估失败，跳过\n")
 
     # ==================== 汇总结果 ====================
+    if len(all_results) == 0:
+        print("\n❌ 没有模型成功评估")
+        exit(1)
+
     print("\n\n" + "=" * 70)
-    print("📊 树模型对比结果汇总")
+    print("📊 模型对比结果汇总")
     print("=" * 70)
 
     results_df = pd.DataFrame(all_results)
@@ -629,7 +704,7 @@ if __name__ == '__main__':
     print("-" * 100)
 
     # 保存结果
-    summary_path = os.path.join(output_dir, 'tree_model_comparison_results.csv')
+    summary_path = os.path.join(output_dir, 'model_comparison_results.csv')
     results_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
     print(f"\n✓ 对比结果已保存: {summary_path}")
 
@@ -641,38 +716,36 @@ if __name__ == '__main__':
     print(f"   RMSE = {best_model['rmse']:.2f}")
     print(f"   MAE = {best_model['mae']:.2f}")
 
-    # 按模型家族分类分析
+    # 按模型类型分类分析
     print("\n" + "=" * 70)
-    print("📈 按模型家族分类对比")
+    print("📈 按模型类型分类对比")
     print("=" * 70)
 
-    model_families = {
-        'Random Forest': [name for name in results_df['model_name'] if name.startswith('RF_')],
-        'Extra Trees': [name for name in results_df['model_name'] if name.startswith('ET_')],
-        'Gradient Boosting': [name for name in results_df['model_name'] if name.startswith('GB_')],
-        'XGBoost': [name for name in results_df['model_name'] if name.startswith('XGB_')],
-        'LightGBM': [name for name in results_df['model_name'] if name.startswith('LGB_')],
-        'CatBoost': [name for name in results_df['model_name'] if name.startswith('CatBoost_')]
+    model_types = {
+        '树模型 (Tree Ensemble)': ['CatBoost_Optimized', 'RF_Optimized'],
+        '深度学习 (Deep Learning)': ['LSTM'],
+        '统计模型 (Statistical)': ['Prophet']
     }
 
-    for family, model_names in model_families.items():
-        family_results = results_df[results_df['model_name'].isin(model_names)]
-        if len(family_results) > 0:
-            best_in_family = family_results.iloc[0]
-            avg_r2 = family_results['r2_mean'].mean()
-            print(f"\n🌳 {family}:")
-            print(f"   最佳: {best_in_family['model_name']} (R²={best_in_family['r2_mean']:.4f})")
+    for type_name, model_names in model_types.items():
+        type_results = results_df[results_df['model_name'].isin(model_names)]
+        if len(type_results) > 0:
+            best_in_type = type_results.iloc[0]
+            avg_r2 = type_results['r2_mean'].mean()
+            print(f"\n🌟 {type_name}:")
+            print(f"   最佳: {best_in_type['model_name']} (R²={best_in_type['r2_mean']:.4f})")
             print(f"   平均: R²={avg_r2:.4f}")
-            print(f"   变体数: {len(family_results)}")
+            print(f"   模型数: {len(type_results)}")
 
-    # Top 5 推荐
+    # Top 推荐
     print("\n" + "=" * 70)
-    print("🎯 Top 5 推荐模型")
+    print("🎯 最终推荐")
     print("=" * 70)
-    top5 = results_df.head(5)
-    for idx, row in top5.iterrows():
+    top3 = results_df.head(3)
+    for idx, row in top3.iterrows():
         print(f"\n  #{idx+1}: {row['model_name']}")
         print(f"      {row['description']}")
         print(f"      R² = {row['r2_mean']:.4f} ± {row['r2_std']:.4f}")
+        print(f"      RMSE = {row['rmse']:.2f}, MAE = {row['mae']:.2f}")
 
-    print("\n✅ 树模型对比完成！")
+    print("\n✅ 模型对比完成！")

@@ -85,36 +85,47 @@ def load_and_prepare_data(site_code):
     df['month'] = df.index.month
     df['is_weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
     
+    # ✅ 新增：时间窗口特征（捕捉早晚高峰）
+    df['is_morning_rush'] = df['hour'].apply(lambda x: 1 if 7 <= x <= 9 else 0)  # 早高峰
+    df['is_evening_rush'] = df['hour'].apply(lambda x: 1 if 17 <= x <= 19 else 0)  # 晚高峰
+    df['is_night'] = df['hour'].apply(lambda x: 1 if 22 <= x or x <= 5 else 0)  # 夜间
+    
     # 2. 周期性特征
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
     
-    # 3. 滞后特征（前1-23小时，共24个时间点）
+    # ✅ 新增：AQI的滚动统计（关键！）
+    df['AQI_mean_3h'] = df['AQI'].rolling(window=3).mean()
+    df['AQI_std_3h'] = df['AQI'].rolling(window=3).std()
+    df['AQI_mean_6h'] = df['AQI'].rolling(window=6).mean()
+    df['AQI_std_6h'] = df['AQI'].rolling(window=6).std()
+    df['AQI_mean_12h'] = df['AQI'].rolling(window=12).mean()
+    df['AQI_trend_3h'] = df['AQI'].diff(3)  # 3小时变化趋势
+    
+    # 3. 滞后特征（✅ 修复：使用完整的24小时滞后特征）
     pollutants = ['PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO']
     for pollutant in pollutants:
         if pollutant in df.columns:
-            for lag in range(1, LAG_HOURS + 1):
+            for lag in range(1, LAG_HOURS + 1):  # 使用完整的1-24小时滞后
                 df[f'{pollutant}_lag{lag}'] = df[pollutant].shift(lag)
     
-    # 4. 滚动窗口特征（✅ 添加12h捕捉中期趋势）
-    rolling_windows = [3, 6, 12]  # 短期+中期，移除24h
+    # 4. 滚动窗口特征（✅ 优化：增加24小时窗口）
+    rolling_windows = [3, 6, 12, 24]  # 新增24小时窗口
     for pollutant in pollutants:
         if pollutant in df.columns:
             for window in rolling_windows:
                 df[f'{pollutant}_mean_{window}h'] = df[pollutant].rolling(window=window).mean()
                 df[f'{pollutant}_std_{window}h'] = df[pollutant].rolling(window=window).std()
-                df[f'{pollutant}_min_{window}h'] = df[pollutant].rolling(window=window).min()
-                df[f'{pollutant}_max_{window}h'] = df[pollutant].rolling(window=window).max()
     
-    # 5. 变化率特征
+    # 5. 变化率特征（✅ 优化：增加中长期变化率）
+    diff_periods = [1, 3, 6, 12, 24]  # 新增6h、12h、24h变化率
     for pollutant in pollutants:
         if pollutant in df.columns:
-            df[f'{pollutant}_diff_1h'] = df[pollutant].diff(1)
-            df[f'{pollutant}_diff_3h'] = df[pollutant].diff(3)
-            df[f'{pollutant}_diff_6h'] = df[pollutant].diff(6)
-    
+            for period in diff_periods:
+                df[f'{pollutant}_diff_{period}h'] = df[pollutant].diff(period)
+
     # 创建目标变量
     df[f'AQI_future_{FORECAST_HOURS}h'] = df['AQI'].shift(-FORECAST_HOURS)
     
@@ -156,18 +167,24 @@ def load_and_prepare_data(site_code):
     y = y[mask]
     dropped_samples = initial_len - len(X)
     
-    time_features = 4
-    periodic_features = 4
-    lag_features_count = 6 * LAG_HOURS
-    rolling_features_count = 6 * 3 * 4  # ✅ 3个窗口
-    diff_features_count = 6 * 3
+    # ✅ 重新计算特征数量
+    time_features_count = sum(1 for col in ['hour', 'day_of_week', 'month', 'is_weekend', 
+                                              'is_morning_rush', 'is_evening_rush', 'is_night'] 
+                               if col in X.columns)
+    periodic_features_count = sum(1 for col in ['hour_sin', 'hour_cos', 'month_sin', 'month_cos'] 
+                                   if col in X.columns)
+    aqi_rolling_count = sum(1 for col in X.columns if col.startswith('AQI_'))
+    lag_count = sum(1 for col in X.columns if '_lag' in col)
+    rolling_count = sum(1 for col in X.columns if '_mean_' in col or '_std_' in col)
+    diff_count = sum(1 for col in X.columns if '_diff_' in col)
     
     print(f"\n✓ 特征数量: {X.shape[1]}, 样本数量: {len(X)}")
-    print(f"  - 时间特征: {time_features}个 (hour, day_of_week, month, is_weekend)")
-    print(f"  - 周期性特征: {periodic_features}个 (hour_sin/cos, month_sin/cos)")
-    print(f"  - 滞后特征: {lag_features_count}个 (6污染物 × {LAG_HOURS}滞后)")
-    print(f"  - 滚动窗口: {rolling_features_count}个 (6污染物 × 3窗口 × 4统计)")
-    print(f"  - 变化率特征: {diff_features_count}个 (6污染物 × 3时间差)")
+    print(f"  - 时间特征: {time_features_count}个")
+    print(f"  - 周期性特征: {periodic_features_count}个")
+    print(f"  - AQI滚动统计: {aqi_rolling_count}个 (✅ 新增)")
+    print(f"  - 滞后特征: {lag_count}个 (✅ 优化为关键时间点)")
+    print(f"  - 滚动窗口: {rolling_count}个 (✅ 只保留均值/标准差)")
+    print(f"  - 变化率特征: {diff_count}个 (✅ 只保留1h/3h)")
     if has_aqi_feature:
         print(f"  - 当前AQI: 1个 (✅ 关键特征)")
     print(f"  - 总计: {X.shape[1]}个")

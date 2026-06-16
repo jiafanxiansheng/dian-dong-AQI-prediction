@@ -9,10 +9,8 @@ from sqlalchemy import create_engine
 import warnings
 warnings.filterwarnings('ignore')
 
-# 导入实时数据获取模块
 from 实时数据获取 import get_or_fetch_data
 
-# ==================== 配置参数 ====================
 DEEPSEEK_API_KEY = "REDACTED_API_KEY"
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
@@ -29,7 +27,6 @@ MODEL_DIR = r'C:\Users\28927\dazuoye\pythonProject3\模型'
 FORECAST_HOURS = 3
 LAG_HOURS = 23
 
-# 站点详细信息（代码 -> 站点名称 + 地区）
 SITE_DETAILS = {
     '1916A': {'name': '环境监测站', 'location': '曲靖'},
     '1917A': {'name': '烟厂办公区', 'location': '曲靖'},
@@ -50,29 +47,61 @@ AQI_LEVELS = {
     (301, 500): {'level': '严重污染', 'color': '褐红色', 'emoji': '', 'desc': '健康警报！请留在室内，必须外出时请佩戴防护口罩'}
 }
 
-# ==================== 加载模型 ====================
+
+class ProphetModelWrapper:
+    """Prophet模型包装器"""
+    
+    def __init__(self, site_name, regressors=None):
+        self.site_name = site_name
+        self.regressors = regressors or []
+        self.model = None
+        self.scaler_y = None
+    
+    def predict(self, df_future):
+        """预测"""
+        if self.model is None:
+            raise ValueError("模型未加载")
+        
+        prophet_df = df_future[['ds'] + self.regressors].copy()
+        forecast = self.model.predict(prophet_df)
+        
+        predictions_scaled = forecast['yhat'].values
+        predictions = self.scaler_y.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+        
+        return predictions
+    
+    @staticmethod
+    def load(filepath):
+        """加载模型"""
+        data = joblib.load(filepath)
+        wrapper = ProphetModelWrapper(data['site_name'], data['regressors'])
+        wrapper.model = data['model']
+        wrapper.scaler_y = data['scaler_y']
+        return wrapper
+
+
 def load_models():
-    """加载所有站点的模型"""
+    """加载所有站点的Prophet模型"""
     models = {}
     for site in SITE_DETAILS.keys():
-        model_path = os.path.join(MODEL_DIR, f'aqi_rf_model_{site}_future{FORECAST_HOURS}h_lag{LAG_HOURS}.pkl')
+        model_path = os.path.join(MODEL_DIR, f'aqi_prophet_model_{site}_future{FORECAST_HOURS}h.pkl')
         if os.path.exists(model_path):
-            models[site] = joblib.load(model_path)
-            print(f"✓ 已加载站点 {site}（{SITE_DETAILS[site]['name']}）的模型")
+            models[site] = ProphetModelWrapper.load(model_path)
+            print(f"✓ 已加载站点 {site}（{SITE_DETAILS[site]['name']}）的Prophet模型")
         else:
             print(f"✗ 未找到站点 {site} 的模型文件")
     return models
 
-# ==================== 数据库连接 ====================
+
 engine = create_engine(
     f"mysql+pymysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
     f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}?"
     f"charset={DB_CONFIG['charset']}"
 )
 
-# ==================== AQI预测函数（增强版） ====================
+
 def predict_aqi(site_name, forecast_hours=FORECAST_HOURS):
-    """预测指定站点未来N小时的AQI"""
+    """使用Prophet预测指定站点未来N小时的AQI"""
     
     if site_name not in models:
         print(f"⚠️ 站点 {site_name} 的模型未加载")
@@ -81,10 +110,8 @@ def predict_aqi(site_name, forecast_hours=FORECAST_HOURS):
     model = models[site_name]
     location = SITE_DETAILS[site_name]['location']
     
-    # 先尝试获取实时数据（如果数据库数据不足）
     realtime_df = get_or_fetch_data(site_name, location, force_fetch=False)
     
-    # 获取最新数据
     table_name = f'air_quality_site_{site_name.lower()}'
     query = f"SELECT * FROM `{table_name}` ORDER BY `datetime` DESC LIMIT 100"
     
@@ -95,7 +122,7 @@ def predict_aqi(site_name, forecast_hours=FORECAST_HOURS):
             print(f"️ 站点 {site_name} 数据不足（{len(df)}条），尝试实时获取...")
             realtime_df = get_or_fetch_data(site_name, location, force_fetch=True)
             if realtime_df is not None:
-                df = pd.read_sql(query, engine)  # 重新读取
+                df = pd.read_sql(query, engine)
         
         if len(df) < 30:
             print(f"✗ 数据仍然不足，无法预测")
@@ -104,61 +131,64 @@ def predict_aqi(site_name, forecast_hours=FORECAST_HOURS):
         df['datetime'] = pd.to_datetime(df['datetime'])
         df = df.set_index('datetime').sort_index()
         
-        # 构建特征
-        latest_row = df.iloc[[-1]].copy()
         latest_time = df.index[-1]
         
-        # 时间特征
-        latest_row['hour'] = latest_time.hour
-        latest_row['day_of_week'] = latest_time.dayofweek
-        latest_row['month'] = latest_time.month
-        latest_row['is_weekend'] = 1 if latest_time.dayofweek >= 5 else 0
+        df_feat = df.copy()
+        df_feat['hour'] = df_feat.index.hour
+        df_feat['day_of_week'] = df_feat.index.dayofweek
+        df_feat['month'] = df_feat.index.month
+        df_feat['is_weekend'] = df_feat['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
         
-        # 周期性特征
-        latest_row['hour_sin'] = np.sin(2 * np.pi * latest_time.hour / 24)
-        latest_row['hour_cos'] = np.cos(2 * np.pi * latest_time.hour / 24)
-        latest_row['month_sin'] = np.sin(2 * np.pi * latest_time.month / 12)
-        latest_row['month_cos'] = np.cos(2 * np.pi * latest_time.month / 12)
-        
-        # 滞后特征
         pollutants = ['PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO']
+        key_lags = [1, 2, 3, 6, 12, 23]
         for pollutant in pollutants:
-            if pollutant in df.columns:
-                for lag in range(1, LAG_HOURS + 1):
-                    if len(df) >= lag:
-                        latest_row[f'{pollutant}_lag{lag}'] = df[pollutant].iloc[-lag]
+            if pollutant in df_feat.columns:
+                for lag in key_lags:
+                    if len(df_feat) >= lag:
+                        df_feat[f'{pollutant}_lag{lag}'] = df_feat[pollutant].shift(lag)
                 
-                # 滚动窗口特征
-                for window in [3, 6, 12, 24]:
-                    if len(df) >= window:
-                        latest_row[f'{pollutant}_mean_{window}h'] = df[pollutant].iloc[-window:].mean()
-                        latest_row[f'{pollutant}_std_{window}h'] = df[pollutant].iloc[-window:].std()
-                        latest_row[f'{pollutant}_min_{window}h'] = df[pollutant].iloc[-window:].min()
-                        latest_row[f'{pollutant}_max_{window}h'] = df[pollutant].iloc[-window:].max()
-                
-                # 变化率特征
-                if len(df) >= 6:
-                    latest_row[f'{pollutant}_diff_1h'] = df[pollutant].iloc[-1] - df[pollutant].iloc[-2]
-                    latest_row[f'{pollutant}_diff_3h'] = df[pollutant].iloc[-1] - df[pollutant].iloc[-4]
-                    latest_row[f'{pollutant}_diff_6h'] = df[pollutant].iloc[-1] - df[pollutant].iloc[-7]
+                for window in [3]:
+                    if len(df_feat) >= window:
+                        df_feat[f'{pollutant}_mean_{window}h'] = df_feat[pollutant].iloc[-window:].mean()
+                        df_feat[f'{pollutant}_std_{window}h'] = df_feat[pollutant].iloc[-window:].std()
         
-        # 确保特征顺序
-        feature_cols = model.feature_names_in_
-        missing_cols = [col for col in feature_cols if col not in latest_row.columns]
-        if missing_cols:
-            print(f"⚠️ 缺少特征: {missing_cols}")
-            return None
+        if len(df_feat) >= 3:
+            df_feat['AQI_mean_3h'] = df_feat['AQI'].iloc[-3:].mean()
+            df_feat['AQI_std_3h'] = df_feat['AQI'].iloc[-3:].std()
+        if len(df_feat) >= 2:
+            df_feat['AQI_diff_1h'] = df_feat['AQI'].iloc[-1] - df_feat['AQI'].iloc[-2]
         
-        latest_row = latest_row[feature_cols]
+        target_col = f'AQI_future_{forecast_hours}h'
+        df_feat[target_col] = df_feat['AQI'].shift(-forecast_hours)
         
-        # 预测
-        predicted_aqi = model.predict(latest_row)[0]
+        df_feat = df_feat.reset_index()
+        df_feat = df_feat.rename(columns={'datetime': 'ds', 'AQI': 'y'})
         
-        # 确保预测值在合理范围内
+        future_row = df_feat.iloc[[-1]].copy()
+        future_ds = latest_time + timedelta(hours=forecast_hours)
+        future_row['ds'] = future_ds
+        
+        # ✅ 修复：检查并填充回归变量中的NaN值
+        regressor_cols = model.regressors
+        for col in regressor_cols:
+            if col in future_row.columns:
+                if future_row[col].isna().any():
+                    # 使用该列的历史中位数填充
+                    historical_median = df_feat[col].median()
+                    future_row[col] = future_row[col].fillna(historical_median)
+        
+        # ✅ 再次检查是否还有NaN
+        missing_regressors = [col for col in regressor_cols if col in future_row.columns and future_row[col].isna().any()]
+        if missing_regressors:
+            print(f"⚠️ 仍有缺失值: {missing_regressors}，使用0填充")
+            for col in missing_regressors:
+                future_row[col] = future_row[col].fillna(0)
+        
+        predicted_aqi = model.predict(future_row)[0]
+        
         predicted_aqi = max(0, min(500, predicted_aqi))
         
-        # 计算预测时间
-        prediction_time = latest_time + timedelta(hours=forecast_hours)
+        prediction_time = future_ds
         
         return {
             'aqi': round(float(predicted_aqi), 1),
@@ -172,13 +202,9 @@ def predict_aqi(site_name, forecast_hours=FORECAST_HOURS):
         traceback.print_exc()
         return None
 
-# ==================== 综合预测地区AQI ====================
+
 def predict_location_aqi(location, forecast_hours=FORECAST_HOURS):
-    """
-    综合预测某个地区所有站点的AQI
-    返回平均AQI和各站点详细信息
-    """
-    # 找出该地区的所有站点
+    """综合预测某个地区所有站点的AQI"""
     location_sites = [site for site, info in SITE_DETAILS.items() 
                      if info['location'] == location]
     
@@ -201,20 +227,18 @@ def predict_location_aqi(location, forecast_hours=FORECAST_HOURS):
         print(f"✗ 地区 {location} 所有站点预测失败")
         return None
     
-    # 计算平均AQI
     avg_aqi = np.mean([p['aqi'] for p in predictions])
     
-    # 找出最新预测时间
     latest_time = max([p['time'] for p in predictions])
     
     return {
         'avg_aqi': round(float(avg_aqi), 1),
         'time': latest_time,
         'site_count': len(predictions),
-        'sites': predictions  # 各站点详细信息
+        'sites': predictions
     }
 
-# ==================== 获取AQI等级信息 ====================
+
 def get_aqi_info(aqi_value):
     """根据AQI值获取等级信息"""
     for (min_val, max_val), info in AQI_LEVELS.items():
@@ -222,7 +246,7 @@ def get_aqi_info(aqi_value):
             return info
     return AQI_LEVELS[(0, 50)]
 
-# ==================== 调用DeepSeek API ====================
+
 def call_deepseek_api(user_query, aqi_info, location, predicted_aqi, site_name=None):
     """调用DeepSeek API生成有情感的回复"""
     
@@ -230,18 +254,15 @@ def call_deepseek_api(user_query, aqi_info, location, predicted_aqi, site_name=N
     emoji = aqi_info['emoji']
     desc = aqi_info['desc']
     
-    # 安全地格式化时间
     try:
         time_str = aqi_info['time'].strftime('%Y年%m月%d日 %H:%M')
     except:
         time_str = "未来3小时"
     
-    # 构建站点信息
     site_info = ""
     if site_name:
         site_info = f"- 监测站点：{site_name}\n"
     
-    # 根据AQI等级选择不同的回复风格
     if predicted_aqi <= 50:
         style_guide = """
 回复风格建议：
@@ -283,7 +304,6 @@ def call_deepseek_api(user_query, aqi_info, location, predicted_aqi, site_name=N
 - 像好朋友在关键时刻的提醒
 """
     
-    # 构建系统提示词（更宽松的指导）
     system_prompt = f"""你是一个贴心的空气质量助手，名叫"清新小助手"。你的任务是根据AQI预测数据，用温暖、有感情的语言回答用户的问题。
 
 当前信息：
@@ -320,11 +340,11 @@ def call_deepseek_api(user_query, aqi_info, location, predicted_aqi, site_name=N
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query}
             ],
-            "temperature": 0.9,  # 提高创造性（原0.7）
-            "max_tokens": 300,   # 增加回复长度（原200）
-            "top_p": 0.95,       # 增加多样性
-            "frequency_penalty": 0.3,  # 减少重复
-            "presence_penalty": 0.3    # 鼓励新话题
+            "temperature": 0.9,
+            "max_tokens": 300,
+            "top_p": 0.95,
+            "frequency_penalty": 0.3,
+            "presence_penalty": 0.3
         }
         
         response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=10)
@@ -337,9 +357,9 @@ def call_deepseek_api(user_query, aqi_info, location, predicted_aqi, site_name=N
         print(f"⚠️ API调用失败: {e}，使用备用回复")
         return generate_fallback_response(user_query, aqi_info, location, predicted_aqi, site_name)
 
-# ==================== 备用回复生成 ====================
+
 def generate_fallback_response(user_query, aqi_info, location, predicted_aqi, site_name=None):
-    """当API调用失败时，生成备用回复（增加多样性）"""
+    """当API调用失败时，生成备用回复"""
     
     aqi_level = aqi_info['level']
     emoji = aqi_info['emoji']
@@ -347,7 +367,6 @@ def generate_fallback_response(user_query, aqi_info, location, predicted_aqi, si
     
     site_text = f"（{site_name}）" if site_name else ""
     
-    # 多样化的回复模板
     if predicted_aqi <= 50:
         templates = [
             f"{emoji} {location}{site_text}的空气太棒啦！AQI只有{predicted_aqi:.0f}，{aqi_level}级别～{desc} 这么好的天气，出去走走吧！🌿✨",
@@ -379,48 +398,37 @@ def generate_fallback_response(user_query, aqi_info, location, predicted_aqi, si
             f"{emoji} {location}{site_text}的空气质量是{aqi_level}，AQI {predicted_aqi:.0f}。{desc} 请一定保护好自己！💪"
         ]
     
-    # 随机选择一个模板
     import random
     return random.choice(templates)
 
-# ==================== 解析用户意图（增强版） ====================
+
 def parse_user_intent(user_input):
-    """
-    解析用户输入，提取地点/站点和意图
-    返回：(预测类型, 目标代码, 目标名称)
-    - 预测类型: 'site'（单站点）或 'location'（地区综合）
-    """
+    """解析用户输入，提取地点/站点和意图"""
     
     user_input_lower = user_input.lower()
     
-    # 1. 首先尝试精确匹配站点名称
     for site_code, site_info in SITE_DETAILS.items():
         site_name = site_info['name']
-        # 检查用户输入是否包含站点名称
         if site_name in user_input_lower or site_name in user_input:
             print(f"🎯 识别到具体站点：{site_name}（{site_code}）")
             return 'site', site_code, site_name
     
-    # 2. 尝试匹配地区
     for site_code, site_info in SITE_DETAILS.items():
         location = site_info['location']
         if location in user_input_lower or location in user_input:
             print(f" 识别到地区：{location}")
             return 'location', location, location
     
-    # 3. 如果没有明确地点，默认使用曲靖地区的综合预测
     print("️ 未识别到具体地点，默认查询曲靖地区")
     return 'location', '曲靖', '曲靖'
 
-# ==================== 主交互函数（增强版） ====================
+
 def chat_with_assistant(user_input):
     """与空气质量助手对话"""
     
-    # 解析用户意图
     predict_type, target_code, target_name = parse_user_intent(user_input)
     
     if predict_type == 'site':
-        # 单站点预测
         print(f"\n🔍 正在查询站点 {target_name}（{target_code}）的空气质量...")
         
         prediction = predict_aqi(target_code)
@@ -428,7 +436,6 @@ def chat_with_assistant(user_input):
         if prediction is None:
             return f"抱歉，暂时无法获取{target_name}站点的空气质量数据，请稍后再试～"
         
-        # 安全检查
         if 'aqi' not in prediction or 'time' not in prediction:
             return f"抱歉，{target_name}站点的预测数据不完整，请稍后再试～"
         
@@ -438,14 +445,12 @@ def chat_with_assistant(user_input):
         print(f"📊 预测结果: AQI={predicted_aqi:.0f}, 等级={aqi_info['level']}")
         print(f"⏰ 预测时间: {prediction['time']}")
         
-        # 调用DeepSeek生成回复（传入aqi_info而不是prediction）
         response = call_deepseek_api(user_input, aqi_info, SITE_DETAILS[target_code]['location'], 
                                     predicted_aqi, site_name=target_name)
         
         return response
     
     else:
-        # 地区综合预测
         print(f"\n🔍 正在查询 {target_name} 地区的空气质量...")
         
         prediction = predict_location_aqi(target_name)
@@ -466,13 +471,6 @@ def chat_with_assistant(user_input):
             print(f"    - {site_pred['site_name']}: AQI={site_pred['aqi']:.0f} ({site_aqi_info['level']})")
         print(f"  ⏰ 预测时间: {prediction['time']}")
         
-        # 构建综合信息
-        site_details = "\n".join([
-            f"    • {s['site_name']}: AQI {s['aqi']:.0f}" 
-            for s in prediction['sites']
-        ])
-        
-        # 调用DeepSeek生成回复（传入aqi_info而不是prediction）
         response = call_deepseek_api(
             user_input, 
             aqi_info, 
@@ -483,13 +481,13 @@ def chat_with_assistant(user_input):
         
         return response
 
-# ==================== 初始化 ====================
+
 print("=" * 60)
-print("🌿 欢迎使用清新小助手 - 滇东空气质量智能预测系统")
+print("🌿 欢迎使用清新小助手 - 滇东空气质量智能预测系统（Prophet版）")
 print("=" * 60)
-print("\n正在加载模型...")
+print("\n正在加载Prophet模型...")
 models = load_models()
-print(f"\n✓ 成功加载 {len(models)} 个站点模型")
+print(f"\n✓ 成功加载 {len(models)} 个站点Prophet模型")
 
 print("\n💡 您可以这样问我：")
 print("  📍 精确站点：")
@@ -501,7 +499,6 @@ print("    - '文山的空气质量怎么样？'")
 print("    - '昭通未来空气好吗？'")
 print("\n输入 'quit' 或 '退出' 结束对话\n")
 
-# ==================== 交互式对话 ====================
 if __name__ == "__main__":
     while True:
         try:

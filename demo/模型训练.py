@@ -2,18 +2,23 @@ import pandas as pd
 import numpy as np
 import pymysql
 from sqlalchemy import create_engine
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 import joblib
 import os
 import warnings
 import time
 
+try:
+    from prophet import Prophet
+    HAS_PROPHET = True
+except ImportError:
+    HAS_PROPHET = False
+    print("⚠️ Prophet未安装，请运行: py -m pip install prophet")
+
 warnings.filterwarnings('ignore')
 
-# ==================== 数据库配置 ====================
 DB_CONFIG = {
     'host': 'localhost',
     'port': 3306,
@@ -23,20 +28,15 @@ DB_CONFIG = {
     'charset': 'utf8mb4'
 }
 
-# 目标站点列表
 target_sites = ['2610A', '2611A', '2596A', '2597A', '1916A', '1917A', '3376A', '3377A']
 
-# ==================== 配置参数 ====================
-FORECAST_HOURS = 3  # 预测未来3小时
-USE_TIME_SERIES_CV = True  # 是否使用时间序列交叉验证
-LAG_HOURS = 23  # 使用前23小时的滞后特征（加上当前时刻共24个时间点）
+FORECAST_HOURS = 3
+LAG_HOURS = 23
 
-# ==================== 创建模型保存目录 ====================
 output_dir = r'C:\Users\28927\dazuoye\pythonProject3\模型'
 os.makedirs(output_dir, exist_ok=True)
 print(f"✅ 模型保存目录: {output_dir}\n")
 
-# ==================== 数据库连接 ====================
 engine = create_engine(
     f"mysql+pymysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
     f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}?"
@@ -44,16 +44,135 @@ engine = create_engine(
 )
 
 
-# ==================== 定义模型训练函数 ====================
+class ProphetModelWrapper:
+    """Prophet模型包装器，支持序列化"""
+    
+    def __init__(self, site_name, regressors=None):
+        self.site_name = site_name
+        self.regressors = regressors or []
+        self.model = None
+        self.scaler_y = None
+    
+    def fit(self, df):
+        """训练Prophet模型"""
+        if not HAS_PROPHET:
+            raise ImportError("Prophet未安装")
+        
+        df_prophet = df.copy()
+        
+        self.scaler_y = MinMaxScaler()
+        target_col = f'AQI_future_{FORECAST_HOURS}h'
+        df_prophet['y_scaled'] = self.scaler_y.fit_transform(df_prophet[target_col].values.reshape(-1, 1))
+        
+        prophet_df = df_prophet[['ds', 'y_scaled'] + self.regressors].copy()
+        prophet_df = prophet_df.rename(columns={'y_scaled': 'y'})
+        
+        self.model = Prophet(
+            growth='linear',
+            yearly_seasonality=True,
+            weekly_seasonality=True,
+            daily_seasonality=True,
+            changepoint_prior_scale=0.05
+        )
+        
+        for reg in self.regressors:
+            self.model.add_regressor(reg)
+        
+        self.model.fit(prophet_df)
+        return self
+    
+    def predict(self, df_future):
+        """预测"""
+        if self.model is None:
+            raise ValueError("模型未训练")
+        
+        prophet_df = df_future[['ds'] + self.regressors].copy()
+        forecast = self.model.predict(prophet_df)
+        
+        predictions_scaled = forecast['yhat'].values
+        predictions = self.scaler_y.inverse_transform(predictions_scaled.reshape(-1, 1)).flatten()
+        
+        return predictions
+    
+    def save(self, filepath):
+        """保存模型"""
+        joblib.dump({
+            'site_name': self.site_name,
+            'regressors': self.regressors,
+            'model': self.model,
+            'scaler_y': self.scaler_y
+        }, filepath)
+    
+    @staticmethod
+    def load(filepath):
+        """加载模型"""
+        data = joblib.load(filepath)
+        wrapper = ProphetModelWrapper(data['site_name'], data['regressors'])
+        wrapper.model = data['model']
+        wrapper.scaler_y = data['scaler_y']
+        return wrapper
+
+
+def prepare_prophet_data(df):
+    """为Prophet准备数据"""
+    df_feat = df.copy()
+    
+    df_feat['hour'] = df_feat.index.hour
+    df_feat['day_of_week'] = df_feat.index.dayofweek
+    df_feat['month'] = df_feat.index.month
+    df_feat['is_weekend'] = df_feat['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
+    
+    pollutants = ['PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO']
+    key_lags = [1, 2, 3, 6, 12, 23]
+    for pollutant in pollutants:
+        if pollutant in df_feat.columns:
+            for lag in key_lags:
+                df_feat[f'{pollutant}_lag{lag}'] = df_feat[pollutant].shift(lag)
+    
+    for pollutant in pollutants:
+        if pollutant in df_feat.columns:
+            df_feat[f'{pollutant}_mean_3h'] = df_feat[pollutant].rolling(window=3).mean()
+            df_feat[f'{pollutant}_std_3h'] = df_feat[pollutant].rolling(window=3).std()
+    
+    df_feat['AQI_mean_3h'] = df_feat['AQI'].rolling(window=3).mean()
+    df_feat['AQI_std_3h'] = df_feat['AQI'].rolling(window=3).std()
+    df_feat['AQI_diff_1h'] = df_feat['AQI'].diff(1)
+    
+    target_col = f'AQI_future_{FORECAST_HOURS}h'
+    df_feat[target_col] = df_feat['AQI'].shift(-FORECAST_HOURS)
+    
+    columns_to_remove = []
+    for col in df_feat.columns:
+        if 'future' in col.lower() and col != target_col:
+            columns_to_remove.append(col)
+        if '_lead' in col.lower():
+            columns_to_remove.append(col)
+    
+    if columns_to_remove:
+        df_feat = df_feat.drop(columns=columns_to_remove)
+    
+    df_feat = df_feat.reset_index()
+    df_feat = df_feat.rename(columns={'datetime': 'ds', 'AQI': 'y'})
+    
+    regressor_cols = ['PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO', 
+                      'hour', 'day_of_week', 'month', 'is_weekend']
+    available_regressors = [col for col in regressor_cols if col in df_feat.columns]
+    
+    initial_len = len(df_feat)
+    df_feat = df_feat.dropna(subset=['ds', 'y'] + available_regressors)
+    dropped = initial_len - len(df_feat)
+    
+    return df_feat, available_regressors, dropped
+
+
 def train_site_model(site_name):
-    """为单个站点训练模型"""
+    """为单个站点训练Prophet模型"""
     print("\n" + "=" * 70)
-    print(f"开始训练站点 {site_name} 的模型")
+    print(f"开始训练站点 {site_name} 的Prophet模型")
     print("=" * 70)
 
     start_time = time.time()
 
-    # 读取数据
     table_name = f'air_quality_site_{site_name.lower()}'
 
     try:
@@ -68,7 +187,6 @@ def train_site_model(site_name):
         print(f"✗ 数据量不足（{len(df)}条），跳过该站点")
         return None
 
-    # 数据预处理
     if 'id' in df.columns:
         df = df.drop('id', axis=1)
 
@@ -77,169 +195,65 @@ def train_site_model(site_name):
     df = df.sort_index()
 
     df = df.dropna(subset=['AQI'])
+    df = df.ffill(limit=3)
     df = df.fillna(df.median())
 
-    # 特征工程
-    # 1. 时间特征
-    df['hour'] = df.index.hour
-    df['day_of_week'] = df.index.dayofweek
-    df['month'] = df.index.month
-    df['is_weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
+    df_prophet, regressors, dropped_count = prepare_prophet_data(df)
+    
+    print(f"\n✓ 数据准备完成:")
+    print(f"  - 样本数量: {len(df_prophet)}")
+    print(f"  - 回归变量: {len(regressors)}个")
+    print(f"  - 因NaN丢弃: {dropped_count}个")
 
-    # 2. 周期性特征
-    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
-    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
-    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+    tscv = TimeSeriesSplit(n_splits=3)
+    cv_scores = {'r2': [], 'rmse': [], 'mae': []}
 
-    # 3. 滞后特征（前1-23小时，加上当前时刻共24个时间点）
-    pollutants = ['PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO']
-    for pollutant in pollutants:
-        if pollutant in df.columns:
-            for lag in range(1, LAG_HOURS + 1):
-                df[f'{pollutant}_lag{lag}'] = df[pollutant].shift(lag)
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(df_prophet)):
+        df_train = df_prophet.iloc[train_idx].copy()
+        df_val = df_prophet.iloc[val_idx].copy()
+        
+        prophet_wrapper = ProphetModelWrapper(site_name, regressors)
+        prophet_wrapper.fit(df_train)
+        
+        val_pred = prophet_wrapper.predict(df_val)
+        y_val_actual = df_val['y'].values
+        
+        min_len = min(len(val_pred), len(y_val_actual))
+        r2 = r2_score(y_val_actual[:min_len], val_pred[:min_len])
+        rmse = np.sqrt(mean_squared_error(y_val_actual[:min_len], val_pred[:min_len]))
+        mae = mean_absolute_error(y_val_actual[:min_len], val_pred[:min_len])
+        
+        cv_scores['r2'].append(r2)
+        cv_scores['rmse'].append(rmse)
+        cv_scores['mae'].append(mae)
+        
+        print(f"  Fold {fold+1}/3: R²={r2:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}")
 
-    # 4. 滚动窗口特征
-    rolling_windows = [3, 6, 12, 24]
-    for pollutant in pollutants:
-        if pollutant in df.columns:
-            for window in rolling_windows:
-                df[f'{pollutant}_mean_{window}h'] = df[pollutant].rolling(window=window).mean()
-                df[f'{pollutant}_std_{window}h'] = df[pollutant].rolling(window=window).std()
-                df[f'{pollutant}_min_{window}h'] = df[pollutant].rolling(window=window).min()
-                df[f'{pollutant}_max_{window}h'] = df[pollutant].rolling(window=window).max()
+    avg_r2 = np.mean(cv_scores['r2'])
+    avg_rmse = np.mean(cv_scores['rmse'])
+    avg_mae = np.mean(cv_scores['mae'])
+    std_r2 = np.std(cv_scores['r2'])
 
-    # 5. 变化率特征
-    for pollutant in pollutants:
-        if pollutant in df.columns:
-            df[f'{pollutant}_diff_1h'] = df[pollutant].diff(1)
-            df[f'{pollutant}_diff_3h'] = df[pollutant].diff(3)
-            df[f'{pollutant}_diff_6h'] = df[pollutant].diff(6)
+    print(f"\n✓ 交叉验证结果: R²={avg_r2:.4f}±{std_r2:.4f}, RMSE={avg_rmse:.2f}, MAE={avg_mae:.2f}")
 
-    # 创建目标变量
-    df[f'AQI_future_{FORECAST_HOURS}h'] = df['AQI'].shift(-FORECAST_HOURS)
+    final_model = ProphetModelWrapper(site_name, regressors)
+    final_model.fit(df_prophet)
 
-    # 删除NaN值
-    df = df.dropna()
+    model_path = os.path.join(output_dir, f'aqi_prophet_model_{site_name}_future{FORECAST_HOURS}h.pkl')
+    final_model.save(model_path)
 
-    # 确保没有数据泄漏
-    columns_to_remove = []
-    for col in df.columns:
-        if 'future' in col.lower() and col != f'AQI_future_{FORECAST_HOURS}h':
-            columns_to_remove.append(col)
-        if '_lead' in col.lower():
-            columns_to_remove.append(col)
-
-    if columns_to_remove:
-        df = df.drop(columns=columns_to_remove)
-
-    features_to_exclude = ['AQI', f'AQI_future_{FORECAST_HOURS}h']
-    target_col = f'AQI_future_{FORECAST_HOURS}h'
-
-    X = df.drop(columns=[c for c in features_to_exclude if c in df.columns])
-    y = df[target_col]
-
-    print(f"✓ 特征数量: {X.shape[1]}, 样本数量: {len(X)}")
-
-    # 模型训练与验证
-    if USE_TIME_SERIES_CV:
-        tscv = TimeSeriesSplit(n_splits=5)
-
-        cv_scores = {
-            'mse': [],
-            'rmse': [],
-            'mae': [],
-            'r2': []
-        }
-
-        final_model = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        )
-
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-            X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
-            y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
-
-            fold_model = RandomForestRegressor(
-                n_estimators=300,
-                max_depth=None,
-                min_samples_split=10,
-                min_samples_leaf=5,
-                max_features='sqrt',
-                random_state=42,
-                n_jobs=-1
-            )
-            fold_model.fit(X_train_fold, y_train_fold)
-
-            y_val_pred = fold_model.predict(X_val_fold)
-
-            mse = mean_squared_error(y_val_fold, y_val_pred)
-            rmse = np.sqrt(mse)
-            mae = mean_absolute_error(y_val_fold, y_val_pred)
-            r2 = r2_score(y_val_fold, y_val_pred)
-
-            cv_scores['mse'].append(mse)
-            cv_scores['rmse'].append(rmse)
-            cv_scores['mae'].append(mae)
-            cv_scores['r2'].append(r2)
-
-        avg_r2 = np.mean(cv_scores['r2'])
-        avg_rmse = np.mean(cv_scores['rmse'])
-        avg_mae = np.mean(cv_scores['mae'])
-
-        print(f"✓ 交叉验证结果: R²={avg_r2:.4f}, RMSE={avg_rmse:.2f}, MAE={avg_mae:.2f}")
-
-        # 使用全部数据训练最终模型
-        final_model.fit(X, y)
-
-    else:
-        split_idx = int(len(X) * 0.8)
-        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-
-        final_model = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features='sqrt',
-            random_state=42,
-            n_jobs=-1
-        )
-        final_model.fit(X_train, y_train)
-
-        y_pred = final_model.predict(X_test)
-
-        avg_r2 = r2_score(y_test, y_pred)
-        avg_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        avg_mae = mean_absolute_error(y_test, y_pred)
-
-        print(f"✓ 测试结果: R²={avg_r2:.4f}, RMSE={avg_rmse:.2f}, MAE={avg_mae:.2f}")
-
-    # 计算特征重要性
-    feature_importance = pd.DataFrame({
-        'feature': X.columns,
-        'importance': final_model.feature_importances_
-    }).sort_values('importance', ascending=False)
-
-    # 保存模型
-    model_path = os.path.join(output_dir, f'aqi_rf_model_{site_name}_future{FORECAST_HOURS}h_lag{LAG_HOURS}.pkl')
-    joblib.dump(final_model, model_path)
-
-    # 保存特征重要性
-    importance_path = os.path.join(output_dir, f'feature_importance_{site_name}.csv')
-    feature_importance.to_csv(importance_path, index=False, encoding='utf-8-sig')
+    importance_data = {
+        'site': site_name,
+        'regressors': ', '.join(regressors),
+        'r2': avg_r2,
+        'rmse': avg_rmse,
+        'mae': avg_mae,
+        'samples': len(df_prophet)
+    }
 
     elapsed_time = time.time() - start_time
 
     print(f"✓ 模型已保存: {model_path}")
-    print(f"✓ 特征重要性已保存: {importance_path}")
     print(f"✓ 训练耗时: {elapsed_time:.2f}秒")
 
     return {
@@ -247,64 +261,61 @@ def train_site_model(site_name):
         'r2': avg_r2,
         'rmse': avg_rmse,
         'mae': avg_mae,
-        'features': X.shape[1],
-        'samples': len(X),
+        'samples': len(df_prophet),
         'time': elapsed_time,
         'model_path': model_path
     }
 
 
-# ==================== 主程序：循环训练所有站点 ====================
-print("=" * 70)
-print("开始批量训练所有站点的AQI预测模型")
-print("=" * 70)
-print(f"\n配置参数:")
-print(f"  - 预测未来: {FORECAST_HOURS}小时")
-print(f"  - 滞后特征: 前{LAG_HOURS}小时（当前时刻 + 过去23小时 = 24个时间点）")
-print(f"  - 交叉验证: {'启用' if USE_TIME_SERIES_CV else '禁用'}")
-print(f"  - 站点数量: {len(target_sites)}个")
+if __name__ == '__main__':
+    if not HAS_PROPHET:
+        print("❌ Prophet未安装，请先安装: py -m pip install prophet")
+        exit(1)
+    
+    print("=" * 70)
+    print("开始批量训练所有站点的Prophet AQI预测模型")
+    print("=" * 70)
+    print(f"\n配置参数:")
+    print(f"  - 预测未来: {FORECAST_HOURS}小时")
+    print(f"  - 滞后特征: 前{LAG_HOURS}小时")
+    print(f"  - 站点数量: {len(target_sites)}个")
 
-# 存储所有站点的训练结果
-all_results = []
+    all_results = []
 
-# 循环训练每个站点
-for i, site_name in enumerate(target_sites, 1):
-    print(f"\n[{i}/{len(target_sites)}] ", end="")
-    result = train_site_model(site_name)
-    if result is not None:
-        all_results.append(result)
+    for i, site_name in enumerate(target_sites, 1):
+        print(f"\n[{i}/{len(target_sites)}] ", end="")
+        result = train_site_model(site_name)
+        if result is not None:
+            all_results.append(result)
 
-# ==================== 汇总结果 ====================
-print("\n\n" + "=" * 70)
-print("所有站点模型训练完成！汇总结果:")
-print("=" * 70)
+    print("\n\n" + "=" * 70)
+    print("所有站点模型训练完成！汇总结果:")
+    print("=" * 70)
 
-if all_results:
-    results_df = pd.DataFrame(all_results)
+    if all_results:
+        results_df = pd.DataFrame(all_results)
 
-    print("\n模型性能对比:")
-    print("-" * 70)
-    print(f"{'站点':<10} | {'R²':<10} | {'RMSE':<10} | {'MAE':<10} | {'特征数':<8} | {'样本数':<10} | {'耗时(s)':<8}")
-    print("-" * 70)
+        print("\n模型性能对比:")
+        print("-" * 70)
+        print(f"{'站点':<10} | {'R²':<10} | {'RMSE':<10} | {'MAE':<10} | {'样本数':<10} | {'耗时(s)':<8}")
+        print("-" * 70)
 
-    for _, row in results_df.iterrows():
+        for _, row in results_df.iterrows():
+            print(
+                f"{row['site']:<10} | {row['r2']:<10.4f} | {row['rmse']:<10.2f} | {row['mae']:<10.2f} | {row['samples']:<10} | {row['time']:<8.2f}")
+
+        print("-" * 70)
         print(
-            f"{row['site']:<10} | {row['r2']:<10.4f} | {row['rmse']:<10.2f} | {row['mae']:<10.2f} | {row['features']:<8} | {row['samples']:<10} | {row['time']:<8.2f}")
+            f"{'平均':<10} | {results_df['r2'].mean():<10.4f} | {results_df['rmse'].mean():<10.2f} | {results_df['mae'].mean():<10.2f}")
 
-    print("-" * 70)
-    print(
-        f"{'平均':<10} | {results_df['r2'].mean():<10.4f} | {results_df['rmse'].mean():<10.2f} | {results_df['mae'].mean():<10.2f}")
+        summary_path = os.path.join(output_dir, 'prophet_model_training_summary.csv')
+        results_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
+        print(f"\n✓ 汇总结果已保存: {summary_path}")
 
-    # 保存汇总结果
-    summary_path = os.path.join(output_dir, 'model_training_summary.csv')
-    results_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
-    print(f"\n✓ 汇总结果已保存: {summary_path}")
+        best_model_idx = results_df['r2'].idxmax()
+        best_model = results_df.loc[best_model_idx]
+        print(f"\n🏆 最佳模型: 站点{best_model['site']}, R²={best_model['r2']:.4f}")
+    else:
+        print("\n✗ 没有成功训练的模型")
 
-    # 找出最佳模型
-    best_model_idx = results_df['r2'].idxmax()
-    best_model = results_df.loc[best_model_idx]
-    print(f"\n🏆 最佳模型: 站点{best_model['site']}, R²={best_model['r2']:.4f}")
-else:
-    print("\n✗ 没有成功训练的模型")
-
-print("\n✅ 所有任务完成！")
+    print("\n✅ 所有任务完成！")

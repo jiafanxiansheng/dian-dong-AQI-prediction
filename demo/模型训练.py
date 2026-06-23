@@ -4,7 +4,6 @@ import pymysql
 from sqlalchemy import create_engine
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error
 from sklearn.preprocessing import MinMaxScaler
-from catboost import CatBoostRegressor
 import joblib
 import os
 import warnings
@@ -28,11 +27,9 @@ DB_CONFIG = {
     'charset': 'utf8mb4'
 }
 
-# ✅ 所有站点使用Prophet，2597A额外使用CatBoost
 target_sites = ['2610A', '2611A', '2596A', '2597A', '1916A', '1917A', '3376A', '3377A']
-tree_model_site = '2597A'  # 专门为这个站点训练树模型
 
-FORECAST_HOURS = 12
+FORECAST_HOURS = 6
 LAG_HOURS = 23
 
 output_dir = r'C:\Users\28927\dazuoye\pythonProject3\模型'
@@ -212,61 +209,8 @@ def evaluate_holdout(model, df_test):
     return r2, rmse, mae, mape
 
 
-def prepare_tree_data(df):
-    """为树模型准备数据"""
-    df_feat = df.copy()
-    
-    df_feat['hour'] = df_feat.index.hour
-    df_feat['day_of_week'] = df_feat.index.dayofweek
-    df_feat['month'] = df_feat.index.month
-    df_feat['is_weekend'] = df_feat['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
-    
-    pollutants = ['PM2.5', 'PM10', 'SO2', 'NO2', 'O3', 'CO']
-    key_lags = [1, 2, 3, 6, 12, 23]
-    for pollutant in pollutants:
-        if pollutant in df_feat.columns:
-            for lag in key_lags:
-                df_feat[f'{pollutant}_lag{lag}'] = df_feat[pollutant].shift(lag)
-    
-    rolling_windows = [3, 6, 12, 24]
-    for pollutant in pollutants:
-        if pollutant in df_feat.columns:
-            for window in rolling_windows:
-                df_feat[f'{pollutant}_mean_{window}h'] = df_feat[pollutant].rolling(window=window).mean()
-                df_feat[f'{pollutant}_std_{window}h'] = df_feat[pollutant].rolling(window=window).std()
-    
-    for window in [3, 6, 12]:
-        df_feat[f'AQI_mean_{window}h'] = df_feat['AQI'].rolling(window=window).mean()
-        df_feat[f'AQI_std_{window}h'] = df_feat['AQI'].rolling(window=window).std()
-    
-    diff_periods = [1, 3, 6, 12]
-    for period in diff_periods:
-        df_feat[f'AQI_diff_{period}h'] = df_feat['AQI'].diff(period)
-    
-    target_col = f'AQI_future_{FORECAST_HOURS}h'
-    df_feat[target_col] = df_feat['AQI'].shift(-FORECAST_HOURS)
-    
-    columns_to_remove = []
-    for col in df_feat.columns:
-        if 'future' in col.lower() and col != target_col:
-            columns_to_remove.append(col)
-        if '_lead' in col.lower():
-            columns_to_remove.append(col)
-    
-    if columns_to_remove:
-        df_feat = df_feat.drop(columns=columns_to_remove)
-    
-    feature_cols = [col for col in df_feat.columns if col not in [target_col]]
-    
-    initial_len = len(df_feat)
-    df_feat = df_feat.dropna()
-    dropped = initial_len - len(df_feat)
-    
-    return df_feat[feature_cols], df_feat[target_col], feature_cols, dropped
-
-
-def train_prophet_model(site_name):
-    """为单个站点训练Prophet模型"""
+def train_site_model(site_name):
+    """为单个站点训练Prophet模型（Hold-out验证版）"""
     print("\n" + "=" * 70)
     print(f"开始训练站点 {site_name} 的Prophet模型")
     print("=" * 70)
@@ -275,9 +219,13 @@ def train_prophet_model(site_name):
 
     table_name = f'air_quality_site_{site_name.lower()}'
 
-    query = f"SELECT * FROM `{table_name}` ORDER BY `datetime`"
-    df = pd.read_sql(query, engine)
-    print(f"✓ 成功读取 {len(df)} 条数据")
+    try:
+        query = f"SELECT * FROM `{table_name}` ORDER BY `datetime`"
+        df = pd.read_sql(query, engine)
+        print(f"✓ 成功读取 {len(df)} 条数据")
+    except Exception as e:
+        print(f"✗ 读取数据失败: {e}")
+        return None
 
     if len(df) < 100:
         print(f"✗ 数据量不足（{len(df)}条），跳过该站点")
@@ -296,11 +244,16 @@ def train_prophet_model(site_name):
 
     df_prophet, regressors, dropped_count = prepare_prophet_data(df)
     
+    if df_prophet is None:
+        print("\n❌ 数据准备失败")
+        return None
+    
     print(f"\n✓ 数据准备完成:")
     print(f"  - 样本数量: {len(df_prophet)}")
     print(f"  - 回归变量: {len(regressors)}个")
     print(f"  - 因NaN丢弃: {dropped_count}个")
 
+    # ✅ Hold-out验证：80%训练，20%测试
     train_size = int(len(df_prophet) * 0.8)
     df_train = df_prophet.iloc[:train_size]
     df_test = df_prophet.iloc[train_size:]
@@ -309,9 +262,11 @@ def train_prophet_model(site_name):
     print(f"  - 训练集: {len(df_train)} 样本 ({train_size/len(df_prophet)*100:.0f}%)")
     print(f"  - 测试集: {len(df_test)} 样本 ({(len(df_prophet)-train_size)/len(df_prophet)*100:.0f}%)")
 
+    # 训练模型
     model = ProphetModelWrapper(site_name, regressors)
     model.fit(df_train)
     
+    # 评估
     r2, rmse, mae, mape = evaluate_holdout(model, df_test)
     
     if np.isnan(mape):
@@ -319,6 +274,8 @@ def train_prophet_model(site_name):
     else:
         print(f"\n✓ 测试集性能: R²={r2:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}, MAPE={mape:.2%}")
 
+    # 用全部数据训练最终模型
+    print(f"\n  使用全部数据训练最终模型...")
     final_model = ProphetModelWrapper(site_name, regressors)
     final_model.fit(df_prophet)
 
@@ -332,137 +289,11 @@ def train_prophet_model(site_name):
 
     return {
         'site': site_name,
-        'model_type': 'Prophet',
         'r2': r2,
         'rmse': rmse,
         'mae': mae,
         'mape': mape if not np.isnan(mape) else None,
         'samples': len(df_prophet),
-        'time': elapsed_time,
-        'model_path': model_path
-    }
-
-
-def train_catboost_for_2597A():
-    """专门为2597A站点训练CatBoost模型"""
-    site_name = tree_model_site
-    
-    print("\n" + "=" * 70)
-    print(f"🌲 为站点 {site_name} 专门训练CatBoost模型")
-    print("=" * 70)
-
-    start_time = time.time()
-
-    table_name = f'air_quality_site_{site_name.lower()}'
-
-    query = f"SELECT * FROM `{table_name}` ORDER BY `datetime`"
-    df = pd.read_sql(query, engine)
-    print(f"✓ 成功读取 {len(df)} 条数据")
-
-    if len(df) < 100:
-        print(f"✗ 数据量不足")
-        return None
-
-    if 'id' in df.columns:
-        df = df.drop('id', axis=1)
-
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    df = df.set_index('datetime')
-    df = df.sort_index()
-
-    df = df.dropna(subset=['AQI'])
-    df = df.ffill(limit=3)
-    df = df.fillna(df.median())
-
-    X, y, feature_names, dropped_count = prepare_tree_data(df)
-    
-    print(f"\n✓ 数据准备完成:")
-    print(f"  - 样本数量: {len(X)}")
-    print(f"  - 特征数量: {len(feature_names)}")
-    print(f"  - 因NaN丢弃: {dropped_count}个")
-
-    train_size = int(len(X) * 0.8)
-    X_train = X.iloc[:train_size]
-    y_train = y.iloc[:train_size]
-    X_test = X.iloc[train_size:]
-    y_test = y.iloc[train_size:]
-    
-    print(f"\n📊 Hold-out验证分割:")
-    print(f"  - 训练集: {len(X_train)} 样本 ({train_size/len(X)*100:.0f}%)")
-    print(f"  - 测试集: {len(X_test)} 样本 ({(len(X)-train_size)/len(X)*100:.0f}%)")
-
-    model = CatBoostRegressor(
-        iterations=300,
-        depth=6,
-        learning_rate=0.1,
-        l2_leaf_reg=3,
-        bagging_temperature=1,
-        random_state=42,
-        verbose=0,
-        thread_count=-1
-    )
-    
-    print(f"\n  训练CatBoost模型...")
-    model.fit(X_train, y_train)
-    
-    y_pred = model.predict(X_test)
-    r2 = r2_score(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae = mean_absolute_error(y_test, y_pred)
-    
-    mask = y_test > 0
-    if mask.sum() > 0:
-        mape = mean_absolute_percentage_error(y_test[mask], y_pred[mask])
-    else:
-        mape = np.nan
-    
-    if np.isnan(mape):
-        print(f"\n✓ 测试集性能: R²={r2:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}, MAPE=N/A")
-    else:
-        print(f"\n✓ 测试集性能: R²={r2:.4f}, RMSE={rmse:.2f}, MAE={mae:.2f}, MAPE={mape:.2%}")
-
-    final_model = CatBoostRegressor(
-        iterations=300,
-        depth=6,
-        learning_rate=0.1,
-        l2_leaf_reg=3,
-        bagging_temperature=1,
-        random_state=42,
-        verbose=0,
-        thread_count=-1
-    )
-    final_model.fit(X, y)
-
-    model_path = os.path.join(output_dir, f'aqi_catboost_model_{site_name}_future{FORECAST_HOURS}h.pkl')
-    joblib.dump({
-        'model': final_model,
-        'feature_names': feature_names,
-        'site_name': site_name
-    }, model_path)
-
-    elapsed_time = time.time() - start_time
-
-    print(f"✓ 模型已保存: {model_path}")
-    print(f"✓ 训练耗时: {elapsed_time:.2f}秒")
-    
-    importances = final_model.feature_importances_
-    importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': importances
-    }).sort_values('importance', ascending=False)
-    
-    print(f"\n  Top 10 重要特征:")
-    for idx, row in importance_df.head(10).iterrows():
-        print(f"    {row['feature']:30s}: {row['importance']:.4f}")
-
-    return {
-        'site': site_name,
-        'model_type': 'CatBoost',
-        'r2': r2,
-        'rmse': rmse,
-        'mae': mae,
-        'mape': mape if not np.isnan(mape) else None,
-        'samples': len(X),
         'time': elapsed_time,
         'model_path': model_path
     }
@@ -474,83 +305,54 @@ if __name__ == '__main__':
         exit(1)
     
     print("=" * 70)
-    print("批量训练所有站点的Prophet模型 + 2597A的CatBoost模型")
+    print(f"开始批量训练所有站点的Prophet AQI预测模型（未来{FORECAST_HOURS}小时）")
     print("=" * 70)
     print(f"\n配置参数:")
     print(f"  - 预测未来: {FORECAST_HOURS}小时")
     print(f"  - 滞后特征: 前{LAG_HOURS}小时")
     print(f"  - 站点数量: {len(target_sites)}个")
-    print(f"  - 特殊站点: {tree_model_site} (额外训练CatBoost)")
     print(f"  - 验证方式: Hold-out (80/20)")
+    print(f"  - 节假日效应: 启用")
+    print(f"  - 增强特征: 6h/12h/24h窗口")
 
     all_results = []
 
-    # 第一阶段：训练所有站点的Prophet模型
-    print("\n\n" + "=" * 70)
-    print("第一阶段：训练所有站点的Prophet模型")
-    print("=" * 70)
-
     for i, site_name in enumerate(target_sites, 1):
         print(f"\n[{i}/{len(target_sites)}] ", end="")
-        result = train_prophet_model(site_name)
+        result = train_site_model(site_name)
         if result is not None:
             all_results.append(result)
 
-    # 第二阶段：为2597A训练CatBoost模型
     print("\n\n" + "=" * 70)
-    print("第二阶段：为2597A训练CatBoost模型")
-    print("=" * 70)
-    
-    catboost_result = train_catboost_for_2597A()
-    if catboost_result is not None:
-        all_results.append(catboost_result)
-
-    # 汇总结果
-    print("\n\n" + "=" * 70)
-    print("所有模型训练完成！结果汇总:")
+    print("所有站点模型训练完成！汇总结果:")
     print("=" * 70)
 
     if all_results:
         results_df = pd.DataFrame(all_results)
 
         print("\n模型性能对比:")
-        print("-" * 90)
-        print(f"{'站点':<10} | {'模型类型':<12} | {'R²':<10} | {'RMSE':<10} | {'MAE':<10} | {'MAPE':<10} | {'样本数':<10} | {'耗时(s)':<8}")
-        print("-" * 90)
+        print("-" * 80)
+        print(f"{'站点':<10} | {'R²':<10} | {'RMSE':<10} | {'MAE':<10} | {'MAPE':<10} | {'样本数':<10} | {'耗时(s)':<8}")
+        print("-" * 80)
 
         for _, row in results_df.iterrows():
             mape_str = f"{row['mape']:.2%}" if row['mape'] is not None else "N/A"
             print(
-                f"{row['site']:<10} | {row['model_type']:<12} | {row['r2']:<10.4f} | {row['rmse']:<10.2f} | {row['mae']:<10.2f} | {mape_str:<10} | {row['samples']:<10} | {row['time']:<8.2f}")
+                f"{row['site']:<10} | {row['r2']:<10.4f} | {row['rmse']:<10.2f} | {row['mae']:<10.2f} | {mape_str:<10} | {row['samples']:<10} | {row['time']:<8.2f}")
 
-        print("-" * 90)
+        print("-" * 80)
+        mape_mean = results_df['mape'].dropna().mean()
+        mape_str = f"{mape_mean:.2%}" if not np.isnan(mape_mean) else "N/A"
+        print(
+            f"{'平均':<10} | {results_df['r2'].mean():<10.4f} | {results_df['rmse'].mean():<10.2f} | {results_df['mae'].mean():<10.2f} | {mape_str:<10}")
 
-        summary_path = os.path.join(output_dir, 'all_models_training_summary_12h.csv')
+        summary_path = os.path.join(output_dir, f'prophet_model_training_summary_{FORECAST_HOURS}h_holdout.csv')
         results_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
         print(f"\n✓ 汇总结果已保存: {summary_path}")
 
-        # 特别对比2597A的两个模型
-        site_2597_results = results_df[results_df['site'] == '2597A']
-        if len(site_2597_results) == 2:
-            print("\n\n🔍 2597A站点对比分析:")
-            print("-" * 70)
-            for _, row in site_2597_results.iterrows():
-                print(f"  {row['model_type']:<12}: R²={row['r2']:.4f}, RMSE={row['rmse']:.2f}, MAE={row['mae']:.2f}")
-            
-            prophet_r2 = site_2597_results[site_2597_results['model_type'] == 'Prophet']['r2'].values[0]
-            catboost_r2 = site_2597_results[site_2597_results['model_type'] == 'CatBoost']['r2'].values[0]
-            
-            if catboost_r2 > prophet_r2:
-                improvement = (catboost_r2 - prophet_r2) / abs(prophet_r2) * 100 if prophet_r2 != 0 else 0
-                print(f"\n  ✅ CatBoost优于Prophet: R²提升 {improvement:.1f}%")
-                print(f"  💡 建议: 2597A站点使用CatBoost模型")
-            else:
-                print(f"\n  ⚠️ Prophet表现更好或相当")
-                print(f"  💡 建议: 继续使用Prophet模型")
-
         best_model_idx = results_df['r2'].idxmax()
         best_model = results_df.loc[best_model_idx]
-        print(f"\n🏆 最佳模型: 站点{best_model['site']} ({best_model['model_type']}), R²={best_model['r2']:.4f}")
+        print(f"\n🏆 最佳模型: 站点{best_model['site']}, R²={best_model['r2']:.4f}")
     else:
         print("\n✗ 没有成功训练的模型")
 

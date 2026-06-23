@@ -38,11 +38,12 @@ engine = create_engine(
 )
 
 # 定义年份范围
-years = range(2021, 2026)  # 2021-2025
+years = range(2014, 2026)
 
 # 循环处理每一年
 for year in years:
     # 构建数据目录路径（根据实际文件路径调整）
+
     data_dir = rf'C:\Users\28927\dazuoye\pythonProject3\data\{year}0101-{year}1231'
     
     # 查找该年份下所有CSV文件

@@ -195,6 +195,68 @@ if __name__ == "__main__":
     except ImportError:
         print("\n[WARN] CatBoost 未安装，跳过")
 
+    # LSTM
+    if HAS_TORCH:
+        print(f"\n评估: LSTM")
+        print("-" * 50)
+
+        class LSTMModel(nn.Module):
+            def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.2):
+                super().__init__()
+                self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers,
+                                    batch_first=True, dropout=dropout)
+                self.fc = nn.Linear(hidden_dim, 1)
+
+            def forward(self, x):
+                out, _ = self.lstm(x)
+                return self.fc(out[:, -1, :])
+
+        # LSTM 需要标准化
+        scaler_x = MinMaxScaler()
+        scaler_y_lstm = MinMaxScaler()
+        X_scaled = scaler_x.fit_transform(X_tree.values)
+        y_scaled = scaler_y_lstm.fit_transform(y_tree.values.reshape(-1, 1)).flatten()
+
+        lstm_scores = {"r2": [], "rmse": [], "mae": []}
+        t0 = time.time()
+        tscv = TimeSeriesSplit(n_splits=5)
+
+        for fold, (train_idx, val_idx) in enumerate(tscv.split(X_scaled)):
+            X_tr = torch.tensor(X_scaled[train_idx], dtype=torch.float32).unsqueeze(1)
+            X_vl = torch.tensor(X_scaled[val_idx], dtype=torch.float32).unsqueeze(1)
+            y_tr = torch.tensor(y_scaled[train_idx], dtype=torch.float32).view(-1, 1)
+            y_vl = torch.tensor(y_scaled[val_idx], dtype=torch.float32).view(-1, 1)
+
+            model = LSTMModel(X_tr.shape[-1])
+            opt = torch.optim.Adam(model.parameters(), lr=0.001)
+            loss_fn = nn.MSELoss()
+
+            for _ in range(50):  # 50 epochs
+                model.train()
+                opt.zero_grad()
+                loss = loss_fn(model(X_tr), y_tr)
+                loss.backward()
+                opt.step()
+
+            model.eval()
+            with torch.no_grad():
+                y_pred_scaled = model(X_vl).numpy().flatten()
+            y_pred = scaler_y_lstm.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+            y_true = scaler_y_lstm.inverse_transform(y_vl.numpy().reshape(-1, 1)).flatten()
+
+            lstm_scores["r2"].append(r2_score(y_true, y_pred))
+            lstm_scores["rmse"].append(np.sqrt(mean_squared_error(y_true, y_pred)))
+            lstm_scores["mae"].append(mean_absolute_error(y_true, y_pred))
+            print(f"  Fold {fold+1}/5: R2={lstm_scores['r2'][-1]:.4f}, RMSE={lstm_scores['rmse'][-1]:.2f}")
+
+        elapsed = time.time() - t0
+        avg_r2, std_r2 = np.mean(lstm_scores["r2"]), np.std(lstm_scores["r2"])
+        print(f"\n[OK] LSTM: R2={avg_r2:.4f}±{std_r2:.4f}, RMSE={np.mean(lstm_scores['rmse']):.2f}, 耗时={elapsed:.1f}s")
+        all_results.append({"model_name": "LSTM", "r2_mean": avg_r2, "r2_std": std_r2,
+                            "rmse": np.mean(lstm_scores["rmse"]),
+                            "mae": np.mean(lstm_scores["mae"]), "time": elapsed,
+                            "description": "LSTM (深度学习)"})
+
     # Prophet
     if HAS_PROPHET:
         print(f"\n评估: Prophet")

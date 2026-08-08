@@ -54,8 +54,7 @@
 
 ```
 历史数据 → 66维特征工程（滞后 + 滚动统计 + 差分 + 周期编码）
-          → 多模型对比（RandomForest R²=0.45 vs Prophet R²=0.907）
-          → 5折时序交叉验证 → 选定 Prophet
+          → 多模型对比 → Prophet R²=0.914 胜出
           → 6h / 12h 多步预测 → AQI 约束[0, 500] → 输出
 ```
 
@@ -200,7 +199,7 @@ python scripts/refresh_data.py
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
-| 预测算法 | Prophet | 经 RandomForest / Prophet 多模型 5 折时序交叉验证对比，Prophet R²=0.907 表现最优 |
+| 预测算法 | Prophet | 四模型对比（RF/CatBoost/LSTM/Prophet）中 R²=0.914 断崖式领先，RMSE 仅为树模型 1/3 |
 | LLM 集成 | DeepSeek Chat | 中文能力强，API 兼容 OpenAI 格式，调用成本低 |
 | 数据获取 | HTTP API (非 Selenium) | 0.1s vs 25s，无浏览器依赖，稳定可靠 |
 | 前端图表 | ECharts 5.5 | 成熟的时间序列可视化库，交互丰富 |

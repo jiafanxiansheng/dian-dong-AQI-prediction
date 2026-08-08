@@ -149,6 +149,8 @@ python app.py
 
 ## 🔄 数据刷新机制
 
+> 早期使用 Selenium + Edge WebDriver 爬取 air.cnemc.cn，但 headless 模式被网站反爬检测拦截（返回 `ERR_EMPTY_RESPONSE`），每次超时 25s 且 100% 失败。后逆向分析其前端 AJAX 调用链，发现数据实际来自 `/HourChangesPublish/GetAqiHistoryByCondition` 接口，改为直接 HTTP POST 请求后响应降至 0.1s，彻底消除浏览器依赖。
+
 ```
 用户查询 → 检查 DB 最新数据时间
               ├─ < 2 小时 → 直接预测
@@ -201,7 +203,7 @@ python scripts/refresh_data.py
 |------|------|------|
 | 预测算法 | Prophet | 四模型对比（RF/CatBoost/LSTM/Prophet）中 R²=0.914 断崖式领先，RMSE 仅为树模型 1/3 |
 | LLM 集成 | DeepSeek Chat | 中文能力强，API 兼容 OpenAI 格式，调用成本低 |
-| 数据获取 | HTTP API (非 Selenium) | 0.1s vs 25s，无浏览器依赖，稳定可靠 |
+| 数据获取 | HTTP API (弃用 Selenium) | Selenium headless 被 air.cnemc.cn 反爬检测屏蔽（ERR_EMPTY_RESPONSE），改调官方 AJAX 接口 `/HourChangesPublish/GetAqiHistoryByCondition`，响应从 25s 降至 0.1s，且无需浏览器依赖 |
 | 前端图表 | ECharts 5.5 | 成熟的时间序列可视化库，交互丰富 |
 | 特征工程 | 66维时序特征 | 6污染物×6阶滞后 + 3窗口滚动统计 + 4阶差分 + 周期编码，捕捉时间依赖 |
 

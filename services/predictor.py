@@ -1,5 +1,5 @@
 """
-AQI 预测引擎 — 支持 Prophet / CatBoost 双模型，自动选择最优
+AQI 预测引擎 — 基于 Prophet 时间序列模型
 """
 import os
 import joblib
@@ -11,7 +11,6 @@ from config import (
     DB_CONFIG,
     MODEL_DIR,
     FORECAST_HOURS_LIST,
-    PRIMARY_FORECAST_HOURS,
     SITE_DETAILS,
     AQI_LEVELS,
 )
@@ -76,109 +75,32 @@ class ProphetModelWrapper:
 
 
 # ═══════════════════════════════════════════════════════════
-#  CatBoost 模型包装器（树模型通用）
-# ═══════════════════════════════════════════════════════════
-
-class CatBoostModelWrapper:
-    """CatBoost / XGBoost / LightGBM 等树模型的通用包装器"""
-
-    def __init__(self, site_name: str, feature_names: list | None = None):
-        self.site_name = site_name
-        self.feature_names = feature_names or []
-        self.model = None
-        self.model_type = "catboost"
-
-    def predict(self, df_features: pd.DataFrame) -> np.ndarray:
-        """使用特征 DataFrame 进行预测"""
-        if self.model is None:
-            raise ValueError("CatBoost 模型未加载")
-        # 确保只使用模型训练时的特征
-        available_features = [f for f in self.feature_names if f in df_features.columns]
-        missing = set(self.feature_names) - set(available_features)
-        if missing:
-            # 为缺失特征补 0
-            for m in missing:
-                df_features[m] = 0
-        X = df_features[self.feature_names].values
-        return self.model.predict(X)
-
-    @staticmethod
-    def load(filepath: str) -> "CatBoostModelWrapper":
-        data = joblib.load(filepath)
-        wrapper = CatBoostModelWrapper(data.get("site_name", ""), data.get("feature_names", []))
-        wrapper.model = data["model"]
-        # 兼容不同的 model_type 标记
-        wrapper.model_type = data.get("model_type", "catboost").lower()
-        return wrapper
-
-
-# ═══════════════════════════════════════════════════════════
 #  模型加载
 # ═══════════════════════════════════════════════════════════
 
-# 每个站点可配置偏好的模型类型（"prophet" / "catboost" / "auto"）
-SITE_MODEL_PREFERENCE = {}
-
-# CatBoost 模型文件名模式（与 demo/2597A尝试.py 输出一致）
-CATBOOST_MODEL_PATTERNS = [
-    "aqi_catboost_optimized_model_{site}_future{fh}h.pkl",
-    "aqi_catboost_model_{site}_future{fh}h.pkl",
-    "aqi_randomforest_optimized_model_{site}_future{fh}h.pkl",
-    "aqi_xgboost_default_model_{site}_future{fh}h.pkl",
-    "aqi_lightgbm_default_model_{site}_future{fh}h.pkl",
-]
-
-
 def load_models() -> dict:
-    """加载所有站点的预测模型（支持 Prophet + CatBoost 双引擎）
-
-    优先级：
-    1. 如果站点在 SITE_MODEL_PREFERENCE 中指定了模型类型 → 优先加载该类型
-    2. 如果 CatBoost 模型存在 → 使用 CatBoost
-    3. 否则 → 使用 Prophet（默认）
+    """加载所有站点的 Prophet 预测模型
 
     Returns:
-        dict: {站点代码: {预测小时数: 模型实例}}
+        dict: {站点代码: {预测小时数: ProphetModelWrapper}}
     """
     models = {}
     for site in SITE_DETAILS:
         models[site] = {}
-        preference = SITE_MODEL_PREFERENCE.get(site, "prophet")
 
         for fh in FORECAST_HOURS_LIST:
-            loaded = False
-
-            # ── 尝试加载 CatBoost 模型 ──
-            if preference in ("catboost", "auto"):
-                for pattern in CATBOOST_MODEL_PATTERNS:
-                    cb_path = os.path.join(MODEL_DIR, pattern.format(site=site, fh=fh))
-                    if os.path.exists(cb_path):
-                        try:
-                            wrapper = CatBoostModelWrapper.load(cb_path)
-                            models[site][fh] = wrapper
-                            print(f"[OK] 已加载站点 {site}（{SITE_DETAILS[site]['name']}）"
-                                  f"的{fh}h {wrapper.model_type.upper()} 模型")
-                            loaded = True
-                        except Exception as e:
-                            print(f"[WARN] 站点 {site} 的{fh}h CatBoost 模型加载失败: {e}")
-                        break
-
-            # ── 回退到 Prophet 模型 ──
-            if not loaded:
-                prophet_path = os.path.join(
-                    MODEL_DIR, f"aqi_prophet_model_{site}_future{fh}h.pkl"
-                )
-                if os.path.exists(prophet_path):
-                    try:
-                        models[site][fh] = ProphetModelWrapper.load(prophet_path)
-                        print(f"[OK] 已加载站点 {site}（{SITE_DETAILS[site]['name']}）"
-                              f"的{fh}h Prophet 模型")
-                        loaded = True
-                    except Exception as e:
-                        print(f"[FAIL] 站点 {site} 的{fh}h Prophet 模型加载失败: {e}")
-
-            if not loaded:
-                print(f"[FAIL] 未找到站点 {site} 的{fh}h模型文件")
+            prophet_path = os.path.join(
+                MODEL_DIR, f"aqi_prophet_model_{site}_future{fh}h.pkl"
+            )
+            if os.path.exists(prophet_path):
+                try:
+                    models[site][fh] = ProphetModelWrapper.load(prophet_path)
+                    print(f"[OK] 已加载站点 {site}（{SITE_DETAILS[site]['name']}）"
+                          f"的{fh}h Prophet 模型")
+                except Exception as e:
+                    print(f"[FAIL] 站点 {site} 的{fh}h Prophet 模型加载失败: {e}")
+            else:
+                print(f"[FAIL] 未找到站点 {site} 的{fh}h模型文件: {prophet_path}")
 
     return models
 
@@ -187,8 +109,8 @@ def load_models() -> dict:
 #  特征工程
 # ═══════════════════════════════════════════════════════════
 
-def _build_prophet_features(df: pd.DataFrame) -> pd.DataFrame:
-    """为 Prophet 模型构造特征（预测时用）"""
+def _build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """为 Prophet 模型构造特征"""
     df_feat = df.copy()
     df_feat["hour"] = df_feat.index.hour
     df_feat["day_of_week"] = df_feat.index.dayofweek
@@ -222,49 +144,6 @@ def _build_prophet_features(df: pd.DataFrame) -> pd.DataFrame:
     return df_feat
 
 
-def _build_tree_features(df: pd.DataFrame) -> pd.DataFrame:
-    """为树模型（CatBoost/RF/XGBoost）构造特征
-
-    这是 demo/2597A尝试.py 中 prepare_tree_data() 的完整版本，
-    包含丰富的滞后特征和滚动统计特征。
-    """
-    df_feat = df.copy()
-    df_feat["hour"] = df_feat.index.hour
-    df_feat["day_of_week"] = df_feat.index.dayofweek
-    df_feat["month"] = df_feat.index.month
-    df_feat["is_weekend"] = df_feat["day_of_week"].apply(lambda x: 1 if x >= 5 else 0)
-
-    pollutants = ["PM2.5", "PM10", "SO2", "NO2", "O3", "CO"]
-    key_lags = [1, 2, 3, 6, 12, 23]
-    for pollutant in pollutants:
-        if pollutant in df_feat.columns:
-            for lag in key_lags:
-                df_feat[f"{pollutant}_lag{lag}"] = df_feat[pollutant].shift(lag)
-
-    rolling_windows = [3, 6, 12, 24]
-    for pollutant in pollutants:
-        if pollutant in df_feat.columns:
-            for window in rolling_windows:
-                df_feat[f"{pollutant}_mean_{window}h"] = (
-                    df_feat[pollutant].rolling(window=window).mean()
-                )
-                df_feat[f"{pollutant}_std_{window}h"] = (
-                    df_feat[pollutant].rolling(window=window).std()
-                )
-
-    for window in [3, 6, 12]:
-        df_feat[f"AQI_mean_{window}h"] = df_feat["AQI"].rolling(window=window).mean()
-        df_feat[f"AQI_std_{window}h"] = df_feat["AQI"].rolling(window=window).std()
-
-    diff_periods = [1, 3, 6, 12]
-    for period in diff_periods:
-        df_feat[f"AQI_diff_{period}h"] = df_feat["AQI"].diff(period)
-
-    # 保留 datetime 列用于时间偏移
-    df_feat = df_feat.reset_index()
-    return df_feat
-
-
 # ═══════════════════════════════════════════════════════════
 #  预测
 # ═══════════════════════════════════════════════════════════
@@ -273,8 +152,6 @@ def predict_aqi(
     site_name: str, models: dict, force_fetch: bool = False
 ) -> dict | None:
     """对指定站点执行多时间步 AQI 预测
-
-    支持 Prophet 和 CatBoost 两种模型，自动根据模型类型选择特征工程策略。
 
     Args:
         site_name: 站点代码（如 "1916A"）
@@ -292,19 +169,16 @@ def predict_aqi(
     table_name = f"air_quality_site_{site_name.lower()}"
     query = f"SELECT * FROM `{table_name}` ORDER BY `datetime` DESC LIMIT 100"
 
-    # 数据新鲜度阈值（小时）：超过此值将触发爬虫更新
     DATA_FRESHNESS_THRESHOLD_HOURS = 2
 
     try:
         df = pd.read_sql(query, _get_engine())
 
         # ── 判断是否需要触发爬虫 ──
-        # 条件1：数据量不足
         need_fetch = len(df) < 30
         if need_fetch:
             print(f"[WARN] 站点 {site_name} 数据库数据不足（{len(df)}条）")
 
-        # 条件2：数据过时（即使数据量够，也可能很久没更新）
         if not need_fetch and len(df) > 0:
             df["datetime"] = pd.to_datetime(df["datetime"])
             latest_in_db = df["datetime"].max()
@@ -328,7 +202,6 @@ def predict_aqi(
                 from services.data_fetcher import get_or_fetch_data
 
                 get_or_fetch_data(site_name, location, force_fetch=True)
-                # 重新读取数据库
                 df = pd.read_sql(query, _get_engine())
             except Exception as e:
                 print(f"[WARN] 实时获取失败 ({e})，使用现有数据继续")
@@ -351,9 +224,8 @@ def predict_aqi(
         if hours_behind > 24:
             print(f"  [WARN] 最新数据距现在 {hours_behind:.0f} 小时，非实时数据")
 
-        # 准备特征（两种类型都准备，根据模型类型选用）
-        df_prophet = _build_prophet_features(df)
-        df_tree = _build_tree_features(df)
+        # 特征工程
+        df_features = _build_features(df)
 
         # 多时间步预测
         multi_preds = {}
@@ -366,32 +238,25 @@ def predict_aqi(
             future_ds = latest_time + timedelta(hours=fh)
 
             try:
-                # ── 根据模型类型选择预测路径 ──
-                if isinstance(model, CatBoostModelWrapper):
-                    # CatBoost / 树模型预测
-                    future_row = df_tree.iloc[[-1]].copy()
-                    predicted_aqi = model.predict(future_row)[0]
-                else:
-                    # Prophet 模型预测
-                    future_row = df_prophet.iloc[[-1]].copy()
-                    future_row["ds"] = future_ds
+                future_row = df_features.iloc[[-1]].copy()
+                future_row["ds"] = future_ds
 
-                    # 填充缺失的回归变量
-                    for col in model.regressors:
-                        if col in future_row.columns and future_row[col].isna().any():
-                            historical_median = df_prophet[col].median()
-                            future_row[col] = future_row[col].fillna(historical_median)
+                # 填充缺失的回归变量
+                for col in model.regressors:
+                    if col in future_row.columns and future_row[col].isna().any():
+                        historical_median = df_features[col].median()
+                        future_row[col] = future_row[col].fillna(historical_median)
 
-                    missing = [
-                        c for c in model.regressors
-                        if c in future_row.columns and future_row[c].isna().any()
-                    ]
-                    if missing:
-                        print(f"[WARN] {fh}h 预测仍有缺失值: {missing}，使用0填充")
-                        for col in missing:
-                            future_row[col] = future_row[col].fillna(0)
+                missing = [
+                    c for c in model.regressors
+                    if c in future_row.columns and future_row[c].isna().any()
+                ]
+                if missing:
+                    print(f"[WARN] {fh}h 预测仍有缺失值: {missing}，使用0填充")
+                    for col in missing:
+                        future_row[col] = future_row[col].fillna(0)
 
-                    predicted_aqi = model.predict(future_row)[0]
+                predicted_aqi = model.predict(future_row)[0]
 
                 # 约束 AQI 范围 [0, 500]
                 predicted_aqi = max(0, min(500, predicted_aqi))
@@ -402,7 +267,7 @@ def predict_aqi(
                 }
 
             except Exception as e:
-                print(f"[ERROR] {fh}h 预测出错 ({type(model).__name__}): {e}")
+                print(f"[ERROR] {fh}h 预测出错: {e}")
                 continue
 
         if not multi_preds:

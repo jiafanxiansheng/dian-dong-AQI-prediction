@@ -30,7 +30,6 @@ from services.predictor import (
     predict_location_aqi,
     get_aqi_info,
     ProphetModelWrapper,
-    CatBoostModelWrapper,
 )
 from services.weather import get_weather_info
 from services.intent_parser import parse_user_intent
@@ -59,21 +58,8 @@ def init_models():
     logger.info("正在加载空气质量预测模型...")
     models = load_models()
 
-    # 统计各类型模型数量
-    prophet_count = 0
-    catboost_count = 0
-    for site_models in models.values():
-        for m in site_models.values():
-            if isinstance(m, CatBoostModelWrapper):
-                catboost_count += 1
-            elif isinstance(m, ProphetModelWrapper):
-                prophet_count += 1
-
     total_sites = sum(1 for m in models.values() if m)
-    logger.info(
-        f"[OK] 成功加载 {total_sites} 个站点模型 "
-        f"(Prophet: {prophet_count}, CatBoost: {catboost_count})"
-    )
+    logger.info(f"[OK] 成功加载 {total_sites} 个站点的 Prophet 模型")
     return models
 
 
@@ -101,11 +87,8 @@ def api_status():
                 "models": {},
             }
             for fh, m in fh_models.items():
-                model_type = (
-                    "catboost" if isinstance(m, CatBoostModelWrapper) else "prophet"
-                )
-                site_info["models"][str(fh)] = model_type
-                model_summary[model_type] = model_summary.get(model_type, 0) + 1
+                site_info["models"][str(fh)] = "prophet"
+                model_summary["prophet"] = model_summary.get("prophet", 0) + 1
             loaded_sites.append(site_info)
 
     return jsonify({
@@ -129,9 +112,8 @@ def api_sites():
         has_models = code in models and bool(models[code])
         model_types = {}
         if has_models:
-            for fh, m in models[code].items():
-                mt = "catboost" if isinstance(m, CatBoostModelWrapper) else "prophet"
-                model_types[str(fh)] = mt
+            for fh in models[code]:
+                model_types[str(fh)] = "prophet"
         sites_list.append({
             "code": code,
             "name": info["name"],

@@ -1,5 +1,5 @@
 """
-模型对比脚本 — 在指定站点上对比 Prophet/CatBoost/RF/LSTM 性能
+模型对比脚本 — 在指定站点上对比 Prophet/RF/LSTM 性能
 使用方式: python scripts/compare_models.py [站点代码] [预测小时数]
 """
 import os
@@ -23,14 +23,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
 from config import DB_CONFIG, COMPARISON_DIR
-
-# 可选依赖
-try:
-    from catboost import CatBoostRegressor
-    HAS_CATBOOST = True
-except ImportError:
-    HAS_CATBOOST = False
-    print("⚠️ CatBoost 未安装，将跳过")
 
 try:
     import torch
@@ -174,19 +166,6 @@ if __name__ == "__main__":
 
     all_results = []
     X_tree, y_tree = None, None
-
-    # CatBoost
-    if HAS_CATBOOST:
-        if X_tree is None:
-            X_tree, y_tree = prepare_features_unified(df_raw)
-        model = CatBoostRegressor(
-            iterations=300, depth=6, learning_rate=0.1,
-            l2_leaf_reg=3, bagging_temperature=1,
-            random_state=42, verbose=0, thread_count=-1,
-        )
-        result = evaluate_tree_cv(model, X_tree, y_tree, "CatBoost")
-        result["description"] = "CatBoost (Boosting)"
-        all_results.append(result)
 
     # RandomForest
     if X_tree is None:

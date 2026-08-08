@@ -20,19 +20,8 @@ joblib>=1.1
 # 时序预测模型
 prophet>=1.1
 
-# 机器学习（模型训练 + 对比）
+# 机器学习（模型评估）
 scikit-learn>=1.0
-catboost>=1.0
 
-# 可选：梯度提升模型
-xgboost>=1.7
-lightgbm>=3.3
-
-# HTTP 请求（天气 API + LLM API）
+# HTTP 请求（天气 API + LLM API + 数据爬取）
 requests>=2.25
-
-# 浏览器自动化（实时数据爬取）
-selenium>=4.0
-
-# 可选：深度学习模型
-# torch>=2.0

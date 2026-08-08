@@ -179,6 +179,22 @@ if __name__ == "__main__":
     result["description"] = "随机森林 (Bagging)"
     all_results.append(result)
 
+    # CatBoost
+    try:
+        from catboost import CatBoostRegressor
+        print(f"\n评估: CatBoost")
+        print("-" * 50)
+        t0 = time.time()
+        cb = CatBoostRegressor(
+            iterations=300, depth=6, learning_rate=0.1,
+            l2_leaf_reg=3, random_state=42, verbose=0, thread_count=-1,
+        )
+        cb_result = evaluate_tree_cv(cb, X_tree, y_tree, "CatBoost")
+        cb_result["description"] = "CatBoost (Boosting)"
+        all_results.append(cb_result)
+    except ImportError:
+        print("\n[WARN] CatBoost 未安装，跳过")
+
     # Prophet
     if HAS_PROPHET:
         print(f"\n评估: Prophet")

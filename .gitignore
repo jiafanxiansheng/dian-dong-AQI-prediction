@@ -1,0 +1,40 @@
+# 环境变量（包含敏感信息）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 原始数据 + 模型文件（过大，不入库，可通过脚本重新生成/导入）
+data/
+模型/
+模型对比/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 日志
+*.log

@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>清新小助手 - 空气质量智能预测</title>
+    <!-- ECharts CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <style>
+        :root {
+            --excellent: #43e97b;
+            --good: #f6d365;
+            --light-pollution: #fa9a3c;
+            --moderate: #e53935;
+            --heavy: #9c27b0;
+            --severe: #8b0000;
+            --primary: #667eea;
+            --primary-dark: #5a6fd6;
+            --bg: #f0f2f5;
+            --card-bg: #ffffff;
+            --text: #2d3436;
+            --text-secondary: #636e72;
+            --border: #e9ecef;
+            --radius: 16px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.08);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: var(--card-bg);
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 860px;
+            max-height: 92vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* ── 头部 ── */
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 24px 30px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+        .header h1 { font-size: 1.8em; margin-bottom: 4px; letter-spacing: 2px; }
+        .header p { opacity: 0.85; font-size: 0.95em; }
+        .status-dot {
+            display: inline-block; width: 8px; height: 8px;
+            border-radius: 50%; background: #43e97b;
+            margin-right: 6px; animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%,100% { opacity: 1; } 50% { opacity: 0.4; }
+        }
+
+        /* ── 快捷查询 ── */
+        .quick-query {
+            padding: 16px 24px;
+            background: #f8f9fa;
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+        .quick-query h3 {
+            margin-bottom: 10px; color: #495057; font-size: 0.9em;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .quick-buttons {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 8px;
+        }
+        .quick-btn {
+            padding: 10px 14px; background: white;
+            border: 1.5px solid var(--primary); border-radius: 10px;
+            cursor: pointer; transition: all 0.25s;
+            font-size: 0.88em; color: var(--primary); font-weight: 500;
+        }
+        .quick-btn:hover {
+            background: var(--primary); color: white;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102,126,234,0.35);
+        }
+
+        /* ── 聊天区域 ── */
+        .chat-container {
+            flex: 1; overflow-y: auto;
+            padding: 20px 24px;
+            display: flex; flex-direction: column; gap: 16px;
+        }
+        .chat-container::-webkit-scrollbar { width: 5px; }
+        .chat-container::-webkit-scrollbar-thumb { background: #ccc; border-radius: 10px; }
+
+        .message { animation: fadeIn 0.35s ease-out; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .message.user { text-align: right; }
+        .message.user .bubble {
+            background: var(--primary); color: white;
+            display: inline-block; max-width: 72%;
+            padding: 12px 18px; border-radius: 18px 18px 4px 18px;
+            line-height: 1.5;
+        }
+        .message.assistant { display: flex; flex-direction: column; gap: 8px; }
+        .message.assistant .bubble {
+            background: #f1f3f5; color: var(--text);
+            display: inline-block; max-width: 85%;
+            padding: 14px 18px; border-radius: 4px 18px 18px 18px;
+            line-height: 1.7; font-size: 0.95em;
+        }
+        .timestamp { font-size: 0.75em; color: #adb5bd; margin-top: 2px; padding: 0 4px; }
+
+        /* ── 数据卡片 ── */
+        .data-card {
+            background: white;
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+            animation: fadeIn 0.4s ease-out;
+            max-width: 100%;
+        }
+        .card-header {
+            padding: 14px 18px;
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            font-weight: 700; font-size: 0.9em; color: #495057;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .card-body { padding: 16px 18px; }
+
+        /* AQI 主指标 */
+        .aqi-main {
+            display: flex; align-items: center; gap: 16px;
+            margin-bottom: 14px;
+        }
+        .aqi-badge {
+            display: inline-flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            min-width: 72px; height: 72px; border-radius: 50%;
+            color: white; font-weight: 700; flex-shrink: 0;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+            position: relative;
+        }
+        .aqi-badge .aqi-num { font-size: 1.6em; line-height: 1; }
+        .aqi-badge .aqi-label { font-size: 0.65em; opacity: 0.9; }
+        .aqi-badge.excellent { background: linear-gradient(135deg, #43e97b, #38f9d7); }
+        .aqi-badge.good { background: linear-gradient(135deg, #f6d365, #fda085); }
+        .aqi-badge.light { background: linear-gradient(135deg, #f093fb, #f5576c); }
+        .aqi-badge.moderate { background: linear-gradient(135deg, #e53935, #e35d5b); }
+        .aqi-badge.heavy { background: linear-gradient(135deg, #8e2de2, #4a00e0); }
+        .aqi-badge.severe { background: linear-gradient(135deg, #5a0000, #8b0000); }
+
+        .aqi-detail { display: flex; flex-direction: column; gap: 3px; }
+        .aqi-detail .level { font-size: 1.15em; font-weight: 700; color: #333; }
+        .aqi-detail .location { font-size: 0.82em; color: #888; }
+        .aqi-detail .desc { font-size: 0.82em; color: #666; margin-top: 2px; }
+
+        .trend-tag {
+            display: inline-flex; align-items: center; gap: 3px;
+            font-size: 0.78em; font-weight: 600; padding: 2px 10px;
+            border-radius: 20px; margin-top: 4px;
+        }
+        .trend-tag.improving { background: #d4edda; color: #155724; }
+        .trend-tag.stable { background: #e2e3e5; color: #6c757d; }
+        .trend-tag.worsening { background: #f8d7da; color: #721c24; }
+
+        /* 趋势图容器 */
+        .chart-container {
+            width: 100%; height: 220px; margin: 12px 0;
+            background: #fafbfc; border-radius: 10px;
+            border: 1px solid var(--border);
+        }
+
+        /* 分步预测横条 */
+        .steps-row {
+            display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0;
+        }
+        .step-item {
+            flex: 1; min-width: 90px; background: #f8f9fa;
+            border-radius: 10px; padding: 10px 12px; text-align: center;
+            transition: transform 0.2s;
+        }
+        .step-item:hover { transform: translateY(-2px); }
+        .step-item .step-time { font-size: 0.75em; color: #999; margin-bottom: 3px; }
+        .step-item .step-aqi { font-size: 1.4em; font-weight: 700; }
+        .step-item .step-level { font-size: 0.72em; color: #888; margin-top: 2px; }
+
+        /* 天气行 */
+        .weather-row {
+            display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+            background: #f8f9fa; border-radius: 10px; padding: 12px 16px;
+            font-size: 0.85em; color: #666; margin-top: 10px;
+        }
+        .weather-temp { font-size: 1.5em; font-weight: 700; color: #333; }
+        .weather-divider { width: 1px; height: 28px; background: #dee2e6; }
+
+        /* 站点列表 */
+        .sites-list { margin-top: 10px; }
+        .sites-title { font-size: 0.82em; color: #888; margin-bottom: 6px; font-weight: 600; }
+        .site-item {
+            display: flex; justify-content: space-between; align-items: center;
+            background: #f8f9fa; border-radius: 8px; padding: 8px 14px;
+            margin-bottom: 4px; font-size: 0.84em;
+        }
+        .site-name { font-weight: 600; color: #495057; }
+        .site-aqis { display: flex; gap: 6px; }
+        .site-aqi-tag {
+            padding: 2px 8px; border-radius: 12px; font-size: 0.82em;
+            color: white; font-weight: 500;
+        }
+        .tag-excellent { background: #43e97b; color: #155724; }
+        .tag-good { background: #f6a623; color: #5a3e00; }
+        .tag-light { background: #fa709a; }
+        .tag-moderate { background: #e53935; }
+        .tag-heavy { background: #9c27b0; }
+        .tag-severe { background: #8b0000; }
+
+        /* ── 输入区域 ── */
+        .input-container {
+            padding: 16px 24px; border-top: 1px solid var(--border);
+            background: white; flex-shrink: 0;
+        }
+        .input-wrapper { display: flex; gap: 10px; }
+        .input-wrapper input {
+            flex: 1; padding: 14px 20px;
+            border: 2px solid var(--border); border-radius: 25px;
+            font-size: 0.95em; outline: none;
+            transition: border-color 0.3s, box-shadow 0.3s;
+        }
+        .input-wrapper input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(102,126,234,0.15);
+        }
+        .send-btn {
+            padding: 14px 28px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white; border: none; border-radius: 25px;
+            cursor: pointer; font-size: 0.95em; font-weight: 600;
+            transition: all 0.25s; white-space: nowrap;
+        }
+        .send-btn:hover { transform: scale(1.05); box-shadow: 0 6px 20px rgba(102,126,234,0.4); }
+        .send-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+
+        /* ── 加载动画 ── */
+        .loading-overlay {
+            display: none; align-items: center; gap: 12px;
+            padding: 14px 20px; color: var(--primary);
+            font-size: 0.9em;
+        }
+        .loading-overlay.active { display: flex; }
+        .spinner {
+            width: 22px; height: 22px;
+            border: 3px solid #e9ecef;
+            border-top: 3px solid var(--primary);
+            border-radius: 50%; animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* ── 底部 ── */
+        .footer {
+            text-align: center; padding: 10px;
+            background: #f8f9fa; color: #adb5bd;
+            font-size: 0.78em; flex-shrink: 0;
+        }
+
+        /* ── 响应式 ── */
+        @media (max-width: 640px) {
+            body { padding: 0; }
+            .container { border-radius: 0; max-height: 100vh; }
+            .header h1 { font-size: 1.3em; }
+            .quick-buttons { grid-template-columns: 1fr 1fr; }
+            .chart-container { height: 180px; }
+            .steps-row { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 头部 -->
+        <div class="header">
+            <h1>🌿 清新小助手</h1>
+            <p><span class="status-dot"></span>滇东空气质量智能预测系统</p>
+        </div>
+
+        <!-- 快捷查询 -->
+        <div class="quick-query">
+            <h3>⚡ 快捷查询</h3>
+            <div class="quick-buttons">
+                <button class="quick-btn" onclick="quickQuery('曲靖')">📍 曲靖地区</button>
+                <button class="quick-btn" onclick="quickQuery('文山州')">📍 文山州</button>
+                <button class="quick-btn" onclick="quickQuery('昭通')">📍 昭通</button>
+                <button class="quick-btn" onclick="quickQuery('曲靖师范学院')">🏫 曲靖师范学院</button>
+                <button class="quick-btn" onclick="quickQuery('烟厂办公区')">🏭 烟厂办公区</button>
+                <button class="quick-btn" onclick="quickQuery('州水务局')">🏛️ 州水务局</button>
+                <button class="quick-btn" onclick="quickQuery('环保局')">🏢 环保局(昭通)</button>
+                <button class="quick-btn" onclick="quickQuery('南苑二区')">🏘️ 南苑二区</button>
+            </div>
+        </div>
+
+        <!-- 聊天区域 -->
+        <div class="chat-container" id="chatContainer">
+            <div class="message assistant">
+                <div class="bubble">
+                    你好！我是<b>清新小助手</b> 🌿<br><br>
+                    我可以帮你查询<b>曲靖、文山州、昭通</b>等滇东地区的空气质量预测。<br><br>
+                    试试输入：<br>
+                    · "曲靖今天空气如何？"<br>
+                    · "曲靖师范学院未来空气好吗？"<br>
+                    · "昭通环保局AQI预测"
+                </div>
+                <div class="timestamp">系统已就绪</div>
+            </div>
+        </div>
+
+        <!-- 加载指示器 -->
+        <div class="loading-overlay" id="loading">
+            <div class="spinner"></div>
+            <span>正在查询空气质量数据...</span>
+        </div>
+
+        <!-- 输入区域 -->
+        <div class="input-container">
+            <div class="input-wrapper">
+                <input
+                    type="text" id="userInput"
+                    placeholder="输入您的问题，例如：曲靖今天空气如何？"
+                    onkeypress="if(event.key==='Enter') sendMessage()"
+                    autocomplete="off"
+                >
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()">发送 ✉️</button>
+            </div>
+        </div>
+
+        <!-- 底部 -->
+        <div class="footer">
+            ℹ️ 覆盖曲靖、昭通、文山州 | 预测未来 6-12 小时 | 数据定时更新
+        </div>
+    </div>
+
+    <script>
+        // ═══════════════════════════════════════════════════
+        //  全局变量 & 工具函数
+        // ═══════════════════════════════════════════════════
+        const chatContainer = document.getElementById('chatContainer');
+        const userInput = document.getElementById('userInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const loading = document.getElementById('loading');
+
+        // AQI 等级色阶
+        const AQI_COLORS = ['#43e97b','#a8e063','#f6d365','#fda085','#fa709a','#f5576c','#e53935','#9c27b0','#8b0000'];
+        const AQI_LEVELS = [
+            { max: 50,  css: 'excellent', label: '优', emoji: '😊', color: '#43e97b' },
+            { max: 100, css: 'good',      label: '良', emoji: '🙂', color: '#f6d365' },
+            { max: 150, css: 'light',     label: '轻度污染', emoji: '😐', color: '#fa709a' },
+            { max: 200, css: 'moderate',  label: '中度污染', emoji: '😷', color: '#e53935' },
+            { max: 300, css: 'heavy',     label: '重度污染', emoji: '😨', color: '#9c27b0' },
+            { max: 500, css: 'severe',    label: '严重污染', emoji: '😱', color: '#8b0000' },
+        ];
+
+        function getAqiInfo(aqi) {
+            for (const level of AQI_LEVELS) {
+                if (aqi <= level.max) return level;
+            }
+            return AQI_LEVELS[AQI_LEVELS.length - 1];
+        }
+
+        function getTagClass(level) {
+            const m = {'优':'tag-excellent','良':'tag-good','轻度污染':'tag-light',
+                       '中度污染':'tag-moderate','重度污染':'tag-heavy','严重污染':'tag-severe'};
+            return m[level] || 'tag-good';
+        }
+
+        // ═══════════════════════════════════════════════════
+        //  ECharts 趋势图
+        // ═══════════════════════════════════════════════════
+
+        function renderTrendChart(container, steps) {
+            if (!steps || steps.length < 2) return;
+
+            const chartDom = container.querySelector('.chart-container');
+            if (!chartDom) return;
+
+            // 销毁旧实例
+            const existing = echarts.getInstanceByDom(chartDom);
+            if (existing) existing.dispose();
+
+            const chart = echarts.init(chartDom);
+
+            const hours = steps.map(s => `+${s.hours}h`);
+            const times = steps.map(s => s.time);
+            const aqiValues = steps.map(s => Math.round(s.aqi));
+
+            // 按 AQI 等级给每个点着色
+            const pointColors = aqiValues.map(v => getAqiInfo(v).color);
+
+            const option = {
+                tooltip: {
+                    trigger: 'axis',
+                    backgroundColor: 'rgba(255,255,255,0.95)',
+                    borderColor: '#e9ecef',
+                    textStyle: { color: '#333', fontSize: 13 },
+                    formatter: function(params) {
+                        const p = params[0];
+                        const info = getAqiInfo(p.value);
+                        return `<b>${p.axisValueLabel}</b><br/>
+                                时间：${times[p.dataIndex]}<br/>
+                                AQI：<b style="color:${info.color}">${p.value}</b>
+                                <span style="color:${info.color}">${info.emoji} ${info.label}</span>`;
+                    }
+                },
+                grid: { left: 40, right: 20, top: 25, bottom: 25 },
+                xAxis: {
+                    type: 'category',
+                    data: hours,
+                    axisLabel: { fontSize: 11, color: '#888' },
+                    axisTick: { show: false },
+                    axisLine: { lineStyle: { color: '#e9ecef' } },
+                },
+                yAxis: {
+                    type: 'value',
+                    name: 'AQI',
+                    min: function(value) { return Math.max(0, value.min - 20); },
+                    max: function(value) { return Math.min(500, value.max + 20); },
+                    splitLine: { lineStyle: { color: '#f1f3f5', type: 'dashed' } },
+                    axisLabel: { fontSize: 11, color: '#888' },
+                    nameTextStyle: { fontSize: 10, color: '#aaa' },
+                },
+                series: [{
+                    type: 'line',
+                    data: aqiValues,
+                    smooth: true,
+                    symbol: 'circle',
+                    symbolSize: 8,
+                    lineStyle: { color: '#667eea', width: 3 },
+                    areaStyle: {
+                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                            { offset: 0, color: 'rgba(102,126,234,0.25)' },
+                            { offset: 1, color: 'rgba(102,126,234,0.02)' }
+                        ])
+                    },
+                    itemStyle: {
+                        color: function(params) { return pointColors[params.dataIndex]; },
+                        borderColor: '#fff',
+                        borderWidth: 2,
+                    },
+                    markLine: {
+                        silent: true,
+                        symbol: 'none',
+                        lineStyle: { color: 'rgba(0,0,0,0.12)', type: 'dashed', width: 1 },
+                        data: [
+                            { yAxis: 50,  label: { formatter: '优', fontSize: 10, color: '#43e97b' } },
+                            { yAxis: 100, label: { formatter: '良', fontSize: 10, color: '#f6a623' } },
+                            { yAxis: 150, label: { formatter: '轻度', fontSize: 10, color: '#fa709a' } },
+                            { yAxis: 200, label: { formatter: '中度', fontSize: 10, color: '#e53935' } },
+                        ]
+                    }
+                }]
+            };
+
+            chart.setOption(option);
+
+            // 响应式调整
+            window.addEventListener('resize', () => chart.resize());
+        }
+
+        // ═══════════════════════════════════════════════════
+        //  趋势判断
+        // ═══════════════════════════════════════════════════
+
+        function getTrendTag(steps) {
+            if (!steps || steps.length < 2) return '';
+            const first = steps[0].aqi;
+            const last = steps[steps.length - 1].aqi;
+            const diff = last - first;
+            const pct = first > 0 ? Math.abs(diff) / first : 0;
+
+            if (pct < 0.05) {
+                return '<span class="trend-tag stable">→ 趋势平稳</span>';
+            } else if (diff > 0) {
+                const arrow = pct > 0.2 ? '↗↗' : '↗';
+                return `<span class="trend-tag worsening">${arrow} 趋于恶化 (+${Math.round(pct*100)}%)</span>`;
+            } else {
+                const arrow = pct > 0.2 ? '↘↘' : '↘';
+                return `<span class="trend-tag improving">${arrow} 趋于好转 (-${Math.round(pct*100)}%)</span>`;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════
+        //  构建数据卡片 HTML
+        // ═══════════════════════════════════════════════════
+
+        function buildDataCard(data) {
+            if (!data) return '';
+
+            const info = getAqiInfo(data.aqi);
+            let html = '<div class="data-card">';
+
+            // 卡片头
+            html += `<div class="card-header">📊 ${data.location} · ${data.site_name || ''}</div>`;
+            html += '<div class="card-body">';
+
+            // AQI 主指标
+            html += '<div class="aqi-main">';
+            html += `<div class="aqi-badge ${info.css}"><span class="aqi-num">${Math.round(data.aqi)}</span><span class="aqi-label">AQI</span></div>`;
+            html += '<div class="aqi-detail">';
+            html += `<div class="level">${info.emoji} ${info.level}</div>`;
+            if (data.steps && data.steps.length > 0) {
+                html += `<div class="location">预测至 ${data.steps[data.steps.length-1].time}</div>`;
+            }
+            html += getTrendTag(data.steps);
+            html += '</div></div>';
+
+            // 趋势图
+            if (data.steps && data.steps.length >= 2) {
+                html += '<div class="chart-container"></div>';
+            }
+
+            // 分步预测
+            if (data.steps && data.steps.length > 0) {
+                html += '<div class="steps-row">';
+                data.steps.forEach(s => {
+                    const si = getAqiInfo(s.aqi);
+                    html += `<div class="step-item">`;
+                    html += `<div class="step-time">+${s.hours}h · ${s.time}</div>`;
+                    html += `<div class="step-aqi" style="color:${si.color}">${Math.round(s.aqi)}</div>`;
+                    html += `<div class="step-level">${si.emoji} ${si.label}</div>`;
+                    html += '</div>';
+                });
+                html += '</div>';
+            }
+
+            // 天气信息
+            if (data.weather) {
+                const w = data.weather;
+                html += '<div class="weather-row">';
+                html += `<span class="weather-temp">🌡️ ${w.temp}°C</span>`;
+                html += '<span class="weather-divider"></span>';
+                html += `<span>🌤️ ${w.weather}</span>`;
+                html += `<span>🤒 体感 ${w.feels_like}°C</span>`;
+                html += `<span>📊 ${w.min_temp}~${w.max_temp}°C</span>`;
+                html += `<span>💧 ${w.humidity}%</span>`;
+                html += `<span>💨 ${w.wind_speed}km/h ${w.wind_dir}</span>`;
+                html += '</div>';
+            }
+
+            // 多站点详情
+            if (data.sites && data.sites.length > 0) {
+                html += '<div class="sites-list">';
+                html += '<div class="sites-title">📋 各站点分时预测</div>';
+                data.sites.forEach(site => {
+                    html += '<div class="site-item">';
+                    html += `<span class="site-name">📍 ${site.name}</span>`;
+                    html += '<span class="site-aqis">';
+                    site.steps.forEach(st => {
+                        html += `<span class="site-aqi-tag ${getTagClass(st.level)}">${st.hours}h: ${Math.round(st.aqi)}</span>`;
+                    });
+                    html += '</span></div>';
+                });
+                html += '</div>';
+            }
+
+            html += '</div></div>';
+            return html;
+        }
+
+        // ═══════════════════════════════════════════════════
+        //  消息管理
+        // ═══════════════════════════════════════════════════
+
+        let chartCounter = 0;
+
+        function addMessage(text, type, data) {
+            const wrapper = document.createElement('div');
+            wrapper.className = `message ${type}`;
+
+            // 数据卡片
+            if (type === 'assistant' && data) {
+                const cardHtml = buildDataCard(data);
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = cardHtml;
+                const cardEl = tempDiv.firstElementChild;
+                if (cardEl) {
+                    wrapper.appendChild(cardEl);
+                }
+            }
+
+            // 对话气泡
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.innerHTML = text.replace(/\n/g, '<br>');
+            wrapper.appendChild(bubble);
+
+            // 时间戳
+            const ts = document.createElement('div');
+            ts.className = 'timestamp';
+            ts.textContent = new Date().toLocaleString('zh-CN');
+            wrapper.appendChild(ts);
+
+            chatContainer.appendChild(wrapper);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+
+            // 渲染图表
+            if (data && data.steps && data.steps.length >= 2) {
+                const cardEl = wrapper.querySelector('.data-card');
+                if (cardEl) {
+                    setTimeout(() => renderTrendChart(cardEl, data.steps), 100);
+                }
+            }
+        }
+
+        function setLoading(isLoading) {
+            loading.classList.toggle('active', isLoading);
+            sendBtn.disabled = isLoading;
+            userInput.disabled = isLoading;
+        }
+
+        // ═══════════════════════════════════════════════════
+        //  API 交互
+        // ═══════════════════════════════════════════════════
+
+        async function sendMessage() {
+            const message = userInput.value.trim();
+            if (!message) return;
+
+            addMessage(message, 'user');
+            userInput.value = '';
+            setLoading(true);
+
+            try {
+                const response = await fetch('/api/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: message })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    addMessage(result.response, 'assistant', result.data);
+                } else {
+                    addMessage('😅 ' + (result.error || '查询遇到问题，请稍后重试'), 'assistant');
+                }
+            } catch (error) {
+                addMessage('⚠️ 网络连接异常，请检查网络后重试', 'assistant');
+            } finally {
+                setLoading(false);
+                userInput.focus();
+            }
+        }
+
+        function quickQuery(location) {
+            const queries = {
+                '曲靖': '曲靖今天空气怎么样？',
+                '文山州': '文山州今天空气好吗？',
+                '昭通': '昭通今天空气质量如何？',
+                '曲靖师范学院': '曲靖师范学院空气质量怎么样？',
+                '烟厂办公区': '烟厂办公区空气质量如何？',
+                '州水务局': '州水务局空气好吗？',
+                '环保局': '环保局空气质量怎么样？',
+                '南苑二区': '南苑二区空气如何？',
+            };
+            userInput.value = queries[location] || `${location}的空气质量如何？`;
+            sendMessage();
+        }
+
+        // 初始化
+        window.onload = () => {
+            userInput.focus();
+            // 加载模型状态
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(d => {
+                    if (d.models_loaded > 0) {
+                        console.log(`✅ ${d.models_loaded} 个站点模型已加载`);
+                    }
+                })
+                .catch(() => {});
+        };
+    </script>
+</body>
+</html>
